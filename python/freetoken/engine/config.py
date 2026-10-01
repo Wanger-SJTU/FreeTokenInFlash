@@ -58,6 +58,19 @@ class EngineConfig:
     cuda_graph_max_bs: int | None = None
     page_size: int = 1
     memory_ratio: float = 0.9
+    # Absolute GPU budget (--gpu-mem, bytes): caps weights + MoE slots + KV pools
+    # combined; the pools are auto-solved to fit under it. Mutually exclusive with
+    # memory_ratio. CUDA graphs / activations sit on top of this budget (a post-init
+    # check warns if actual usage exceeds it). Works for dense models too (KV sizing).
+    gpu_mem_budget: int | None = None
+    # Host RAM budget (--cpu-mem, bytes): bounds the PINNED expert-bank memory. Layers
+    # that fit keep today's all-pinned behavior; the rest load as file-backed spill
+    # banks (page-cache-paged, never pinned) and decode on the CPU executor. None =
+    # every layer pinned (default). Startup-time only (no runtime re-planning).
+    cpu_mem_budget: int | None = None
+    # Where --cpu-mem spill files live (default: the model directory; they are unlinked
+    # immediately and their disk space is freed at process exit).
+    cpu_mem_spill_dir: str | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.

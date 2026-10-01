@@ -835,6 +835,7 @@ def setup_offload_expert_banks(
     model_path: str, model_config, *, device: torch.device, dtype: torch.dtype,
     dummy: bool = False, parallel: bool = False, workers: int = 8, chunk: int = 8 << 20,
     decode_target: str = "gpu", layer_sink=None,
+    layer_backing: list[str] | None = None, spill_dir: str | None = None,
 ):
     """Build the routed-expert offload banks. The qwen3_5_moe module always exports this hook,
     so it intercepts *every* qwen3_5_moe offload load -- defer non-block-fp8 checkpoints (plain
@@ -856,7 +857,8 @@ def setup_offload_expert_banks(
 
         return _PROVIDERS[eq](model_path, model_config, device, dtype, dummy,
                               parallel=parallel, workers=workers, chunk=chunk,
-                              decode_target=decode_target, layer_sink=layer_sink)
+                              decode_target=decode_target, layer_sink=layer_sink,
+                              layer_backing=layer_backing, spill_dir=spill_dir)
     if get_tp_info().size > 1:
         raise NotImplementedError("qwen3_5_moe fp8 expert banks support TP=1 only")
     from freetoken.moe.expert_banks import ExpertBanks
@@ -866,10 +868,11 @@ def setup_offload_expert_banks(
         raise ValueError(f"FREETOKEN_FP8_EXPERTS must be 'fp8' or 'bf16', got {mode!r}")
     sink = None if dummy else layer_sink
     if mode == "bf16":
-        return _setup_bf16_dequant_banks(model_path, model_config, device, dummy, layer_sink=sink)
+        return _setup_bf16_dequant_banks(model_path, model_config, device, dummy, layer_sink=sink,
+                                         layer_backing=layer_backing, spill_dir=spill_dir)
     banks = _build_fp8_expert_banks(
         model_path, model_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
-        pin=True, layer_sink=sink,
+        pin=True, layer_sink=sink, layer_backing=layer_backing, spill_dir=spill_dir,
     )
     return ExpertBanks("fp8_block", banks, streamed=sink is not None)
 
@@ -892,6 +895,7 @@ def _expert_reader(model_path, device):
 def _build_fp8_expert_banks(
     model_path, config, *, dummy: bool, parallel: bool | None = None,
     workers: int = 8, chunk: int = 8 << 20, pin: bool = True, layer_sink=None,
+    layer_backing: list[str] | None = None, spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """The single block-fp8 routed-expert reader, shared by offload (``pin=True`` -> per-layer
     :class:`HostBank` banks, pin-after-fill / streamable) and resident (``pin=False`` -> plain
@@ -921,7 +925,9 @@ def _build_fp8_expert_banks(
     if pin:
         from freetoken.moe.host_banks import alloc_layer_banks
 
-        hb = alloc_layer_banks(specs, L)  # lazy anon mmaps (unpinned)
+        # --cpu-mem: pageable layers allocate file-backed spill banks (never pinned).
+        hb = alloc_layer_banks(specs, L, backing="anon" if layer_backing is None else layer_backing,
+                               spill_dir=spill_dir)  # lazy anon mmaps (unpinned)
         banks = {name: [b.tensor for b in hb[name]] for name in specs}
     else:  # resident dequant source: plain pageable tensors (never pinned / streamed)
         banks = {name: [torch.empty(shape, dtype=dt) for _ in range(L)] for name, (shape, dt) in specs.items()}
@@ -999,7 +1005,8 @@ def _build_fp8_expert_banks(
     return banks
 
 
-def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, layer_sink=None):
+def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, layer_sink=None,
+                              layer_backing: list[str] | None = None, spill_dir: str | None = None):
     from freetoken.models.weight import dummy_moe_expert_sources
     from freetoken.moe.expert_banks import ExpertBanks
 
@@ -1012,7 +1019,9 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
 
     L, E, H, I, dense = _moe_dims(model_config)
     specs = {"gate_up": ((E, 2 * I, H), torch.bfloat16), "down": ((E, H, I), torch.bfloat16)}
-    hb = alloc_layer_banks(specs, L)  # lazy anon mmaps (unpinned)
+    # --cpu-mem: pageable layers allocate file-backed spill banks (never pinned).
+    hb = alloc_layer_banks(specs, L, backing="anon" if layer_backing is None else layer_backing,
+                           spill_dir=spill_dir)  # lazy anon mmaps (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
     gate_up, down = banks["gate_up"], banks["down"]
     reader = _expert_reader(model_path, device)
@@ -1054,7 +1063,9 @@ def _setup_bf16_dequant_banks(model_path, model_config, device, dummy: bool, *, 
 
 
 def load_nvfp4_expert_sources(
-    model_path: str, config, *, layer_sink=None
+    model_path: str, config, *, layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build the CPU NVFP4 expert source banks for the offload cache (gate/up fused on the
     output-row axis, down separate; weight_scale_2 carried as the per-row global scale)."""
@@ -1065,11 +1076,15 @@ def load_nvfp4_expert_sources(
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
+        layer_backing=layer_backing,
+        spill_dir=spill_dir,
     )
 
 
 def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ):
     """parallel: same NVFP4 source banks via the common chunked multi-threaded reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
@@ -1083,6 +1098,8 @@ def load_nvfp4_expert_sources_parallel(
         workers=workers,
         chunk=chunk,
         layer_sink=layer_sink,
+        layer_backing=layer_backing,
+        spill_dir=spill_dir,
     )
 
 

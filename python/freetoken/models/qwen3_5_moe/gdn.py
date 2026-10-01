@@ -77,6 +77,10 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
+        # Split in_proj (in_proj_qkvz + in_proj_ba) instead of the fused single GEMM:
+        # the fp8 checkpoints (constructor) and the GGUF convert hook (post-hoc, for the
+        # packed qkvz GEMM + F32 b/a) both use it.
+        self._split_proj = self._fp8
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
         if self._fp8:
@@ -161,7 +165,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._split_proj:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)

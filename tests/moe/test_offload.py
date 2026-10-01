@@ -675,3 +675,60 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
     bf16 = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
     with pytest.raises(ValueError, match="num_experts"):
         bf16.validate_rebuild(3)  # below the num_experts floor
+
+
+def test_set_bank_sources_accepts_file_backed_pageable_layers():
+    # --cpu-mem: spilled layers arrive as PAGEABLE residency and must be accepted (only
+    # the GPU movement paths refuse them, via is_pinned_layer -> the torch fallback).
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    cache.set_bank_sources(
+        {"gate_up": [torch.randn(4, 32, 8)] * 2, "down": [torch.randn(4, 8, 16)] * 2},
+        layer_residency=["pinned", "pageable"],
+    )
+    assert cache.is_pinned_layer(0) is True
+    assert cache.is_pinned_layer(1) is False
+
+
+def test_set_bank_sources_still_rejects_locked_residency():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    with pytest.raises(NotImplementedError, match="LOCKED"):
+        cache.set_bank_sources(
+            {"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]},
+            layer_residency=["locked"],
+        )
+
+
+def test_copy_missing_serves_spilled_layer_through_torch_fallback():
+    # A file-backed layer's rows have no device alias, so copy_missing must fall back to
+    # plain torch indexing (the prefill materialize path is the only caller).
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    gate_up = torch.randn(4, 32, 8)
+    down = torch.randn(4, 8, 16)
+    cache.set_bank_sources(
+        {"gate_up": [gate_up], "down": [down]}, layer_residency=["pageable"],
+    )
+
+    # Stage a two-row miss the way ensure_experts/materialize_layer would: slots 0/1
+    # evicted, source rows 3/2.
+    cache._pending_src_layer = 0
+    cache.evict_slots[0] = 0
+    cache.evict_slots[1] = 1
+    cache.src_indices[0] = 3
+    cache.src_indices[1] = 2
+    cache.num_indices[0] = 2
+
+    cache.copy_missing()
+
+    assert torch.equal(cache.bank_caches["gate_up"][0], gate_up[3])
+    assert torch.equal(cache.bank_caches["gate_up"][1], gate_up[2])
+    assert torch.equal(cache.bank_caches["down"][0], down[3])
+    assert torch.equal(cache.bank_caches["down"][1], down[2])

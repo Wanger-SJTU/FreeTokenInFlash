@@ -313,14 +313,22 @@ class _PlainBank:
         pass
 
 
-def _alloc_expert_bank(shape: tuple[int, ...], *, dtype: torch.dtype):
+def _alloc_expert_bank(
+    shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    backing: str = "anon",
+    spill_dir: str | None = None,
+):
     """Allocate an UNPINNED bank (lazy host mmap), to be filled then pinned at the end --
     pin-after-fill. Registering already-resident pages skips cudaHostAlloc's slow commit
-    (~2.8 GiB/s) / zero-fill. Returns a bank object exposing ``.tensor`` and ``.pin()``."""
+    (~2.8 GiB/s) / zero-fill. Returns a bank object exposing ``.tensor`` and ``.pin()``.
+    ``backing="file"`` (--cpu-mem spill) allocates over an unlinked tmpfile instead: the
+    filled pages are dropped after fill and re-fault from disk on demand."""
     if torch.cuda.is_available():
         from freetoken.moe.host_banks import HostBank
 
-        return HostBank(tuple(shape), dtype)
+        return HostBank(tuple(shape), dtype, backing=backing, spill_dir=spill_dir)
     return _PlainBank(torch.empty(shape, dtype=dtype))
 
 
@@ -334,6 +342,8 @@ def _copy_expert_layer_into_bank(
     layer: int,
     config,
     dtype: torch.dtype,
+    backing: str = "anon",
+    spill_dir: str | None = None,
 ) -> None:
     if layer < 0 or layer >= config.num_layers:
         raise ValueError(
@@ -354,7 +364,8 @@ def _copy_expert_layer_into_bank(
     bank = banks[bank_name][layer]
     if bank is None:
         banks[bank_name][layer] = bank = _alloc_expert_bank(
-            (config.num_experts, *tensor.shape[1:]), dtype=dtype
+            (config.num_experts, *tensor.shape[1:]), dtype=dtype,
+            backing=backing, spill_dir=spill_dir,
         )
     bank.tensor.copy_(tensor)  # whole-layer arrival; pinned later, after fully resident
     seen_layers[bank_name].add(layer)
@@ -366,6 +377,8 @@ def stream_moe_expert_sources(
     *,
     dtype: torch.dtype,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Stream packed per-layer BF16 expert tensors into final offload banks.
 
@@ -379,8 +392,17 @@ def stream_moe_expert_sources(
     the tracker fires into it instead -- nothing is pinned, and the sink may release
     banks it has written out, so the returned tensors are only valid until then (the
     caller owns that tradeoff).
+
+    ``layer_backing`` (--cpu-mem): per-layer ``"pinned"``/``"pageable"`` plan; pageable
+    layers allocate file-backed spill banks (never pinned; the PinPipeline drops their
+    pages after fill instead of registering them).
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
+
+    def _backing_for(layer: int) -> str:
+        if layer_backing is None:
+            return "anon"
+        return "anon" if layer_backing[layer] == "pinned" else "file"
 
     banks: dict[str, list] = {  # name -> per-layer [bank obj (HostBank/_PlainBank) or None]
         "gate_up": [None] * config.num_layers,
@@ -406,6 +428,8 @@ def stream_moe_expert_sources(
                 layer=layer,
                 config=config,
                 dtype=dtype,
+                backing=_backing_for(layer),
+                spill_dir=spill_dir,
             )
             tracker.note(layer)
 

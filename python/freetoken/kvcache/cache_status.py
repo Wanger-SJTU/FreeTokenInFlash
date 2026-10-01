@@ -209,7 +209,31 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
         _baseline = int(engine._baseline_free or 0)
         _weights = int(engine._weights_bytes or 0)
         _mr = float(cfg.memory_ratio) if cfg is not None else 1.0
-        meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0)) if _baseline > 0 else 0
+        _gpu_budget = getattr(cfg, "gpu_mem_budget", None) if cfg is not None else None
+        if _gpu_budget is not None:
+            meta["cache_budget_bytes"] = max(0, _net_budget(0, 0, _weights, 0, gpu_budget=_gpu_budget))
+        elif _baseline > 0:
+            meta["cache_budget_bytes"] = max(0, _net_budget(_mr, _baseline, _weights, 0))
+        else:
+            meta["cache_budget_bytes"] = 0
     except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
         meta["cache_budget_bytes"] = 0
+    # Host-side expert-bank residency + memory budgets (--gpu-mem / --cpu-mem): the
+    # layer split the engine's plan produced and the absolute budgets, so a client can
+    # show the host tier of the expert cache. Callers treat a missing key as "no host
+    # budget to report" (engines predating the knobs never emit one).
+    try:
+        moe = engine.moe_offload_cache
+        residency = list(getattr(moe, "layer_residency", None) or [])
+        meta["host"] = {
+            "gpu_budget_bytes": int(getattr(cfg, "gpu_mem_budget", None) or 0),
+            "cpu_budget_bytes": int(getattr(cfg, "cpu_mem_budget", None) or 0),
+            "pinned_layers": sum(1 for r in residency if r == "pinned"),
+            "spilled_layers": sum(1 for r in residency if r != "pinned"),
+            "spill_dir": str(
+                getattr(cfg, "cpu_mem_spill_dir", None) or getattr(cfg, "model_path", "") or ""
+            ),
+        }
+    except Exception:  # noqa: BLE001 -- best-effort; readiness must not depend on this
+        pass
     return meta

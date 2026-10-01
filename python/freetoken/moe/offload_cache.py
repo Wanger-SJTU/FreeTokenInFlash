@@ -45,6 +45,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF K-quant experts (qwen35moe GGUF): same packed-row layout with
+    # per-bank types (typically Q4_K gate_up [L*E, 2I, H//256*144] + Q5_K down
+    # [L*E, H, I//256*176], unsloth UD stragglers requantized onto the majority).
+    "gguf_kq": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -275,10 +279,12 @@ class OffloadMoeCache:
         repackers (see ``_BANK_SCHEMAS`` and :mod:`freetoken.moe.nvfp4_backends`)
         -- the cache machinery is layout-agnostic and just moves rows.
 
-        ``layer_residency`` labels each layer with a ``HostResidency`` value
-        (default: all pinned). Non-pinned layers have no device address, so the
-        GPU movement paths cannot serve them and they are rejected here
-        (platform-specific residency policies are not implemented).
+        ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all
+        pinned). Non-pinned layers are FILE-BACKED spill banks (the --cpu-mem budget's
+        over-budget layers): the GPU movement kernels cannot dereference them, so they
+        are never pinned, never part of the fused copy plan, and must decode on the CPU
+        executor (the engine folds them into ``cpu_layer_ids``); ``copy_missing`` serves
+        their prefill materialization through a torch fallback instead of the fused copy.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -288,10 +294,10 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        if any(r != HostResidency.PINNED.value for r in residency):
+        if any(r not in (HostResidency.PINNED.value, HostResidency.PAGEABLE.value) for r in residency):
             raise NotImplementedError(
-                "non-pinned host bank layers need platform-specific movement "
-                "paths that are not implemented; only pinned layers are served"
+                "only pinned and file-backed pageable host bank layers are served; "
+                "LOCKED residency is platform-specific and not implemented"
             )
         self.layer_residency = list(residency)
         for name in self.bank_schema:
@@ -320,8 +326,10 @@ class OffloadMoeCache:
 
         Built once here (and on :meth:`rebuild`, which reallocates the slot caches);
         the addresses are fixed for the cache's lifetime so the descriptor tensors are
-        CUDA-graph safe. Disabled (-> per-bank fallback) if any bank's row bytes or base
-        address is not 16-byte aligned, or via FREETOKEN_FUSED_COPY=0.
+        CUDA-graph safe. Per LAYER, disabled (-> per-bank fallback) if any of that
+        layer's bank source addresses is not resolvable to a device alias (file-backed
+        spilled banks are not registered) or not 16-byte aligned, or globally via
+        FREETOKEN_FUSED_COPY=0.
         """
         self._copy_fused_ok = False
         self._copy_dst_ptrs = None
@@ -333,12 +341,13 @@ class OffloadMoeCache:
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
+        self._layer_fused_ok: list[bool] = [False] * self.num_layers
         if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
             return
         from freetoken.kernel.pinned import device_ptr
 
         dst_ptrs, feats = [], []
-        layer_src_ptrs = [[] for _ in range(self.num_layers)]
+        layer_src_ptrs: list[list[int] | None] = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
@@ -346,21 +355,35 @@ class OffloadMoeCache:
             for layer_id, source in enumerate(per_layer):
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
-                # Windows/WDDM).
-                src_dev = device_ptr(source)
+                # Windows/WDDM). File-backed spill banks have none: that layer falls
+                # back to the torch copy path.
+                try:
+                    src_dev = device_ptr(source)
+                except Exception:
+                    layer_src_ptrs[layer_id] = None
+                    continue
+                if layer_src_ptrs[layer_id] is None:
+                    continue
                 if src_dev % 16 != 0:
-                    return
+                    layer_src_ptrs[layer_id] = None
+                    continue
                 layer_src_ptrs[layer_id].append(src_dev)
             dst_ptrs.append(cache.data_ptr())
             feats.append(feat)
+        self._layer_fused_ok = [
+            ptrs is not None and len(ptrs) == len(feats) for ptrs in layer_src_ptrs
+        ]
+        # Only keep layers with a complete plan; per-bank rows for the others.
+        self._copy_src_ptrs_host = [
+            ptrs if ok else [] for ptrs, ok in zip(layer_src_ptrs, self._layer_fused_ok)
+        ]
+        self._copy_dst_ptrs_host = dst_ptrs
         self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
         self._copy_src_ptrs = [
-            torch.tensor(ptrs, dtype=torch.int64, device=self.device)
-            for ptrs in layer_src_ptrs
+            torch.tensor(ptrs, dtype=torch.int64, device=self.device) if ptrs else None
+            for ptrs in self._copy_src_ptrs_host
         ]
         self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
-        self._copy_dst_ptrs_host = dst_ptrs
-        self._copy_src_ptrs_host = layer_src_ptrs
         self._copy_feat_bytes_host = feats
         # hit-D2D gather serves only the big banks; small banks are whole-layer
         # H2D entries (see _SMALL_BANK_FEAT_BYTES), so their rows never need D2D.
@@ -490,6 +513,17 @@ class OffloadMoeCache:
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
         return layer_id in self.cpu_layer_ids
+
+    def is_pinned_layer(self, layer_id: int) -> bool:
+        """Whether ``layer_id``'s host banks are pinned (GPU movement paths may read
+        them). File-backed (spilled, --cpu-mem) layers are not: their misses go through
+        the torch fallback in ``copy_missing`` and their decode lives on the CPU
+        executor."""
+        from freetoken.moe.host_banks import HostResidency
+
+        if not self.layer_residency:
+            return True
+        return self.layer_residency[layer_id] == HostResidency.PINNED.value
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -638,6 +672,10 @@ class OffloadMoeCache:
                 f"cache_size {self.cache_size} leaves no hit region "
                 f"(needs > {2 * self.num_experts} slots)"
             )
+        elif not all(self._layer_fused_ok):
+            # a spilled (--cpu-mem) layer has no device alias; the batch API needs
+            # every layer's host pointers, so the split degrades to full-layer copies
+            reason = "a file-backed (spilled) layer is not part of the fused copy plan"
         elif not self._resolve_batch_memcpy():
             reason = "cudaMemcpyBatchAsync is unavailable"  # resolve logged the specifics
         else:
@@ -927,7 +965,7 @@ class OffloadMoeCache:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
-        if self._copy_fused_ok:
+        if self._copy_fused_ok and self._layer_fused_ok[layer_id]:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per
@@ -944,6 +982,10 @@ class OffloadMoeCache:
             )
             return
 
+        if not self.is_pinned_layer(layer_id):
+            self._copy_missing_pageable(layer_id)
+            return
+
         from freetoken.kernel import fast_index_copy_jit
 
         for per_layer, cache in self.banks:
@@ -954,6 +996,23 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+
+    def _copy_missing_pageable(self, layer_id: int) -> None:
+        """Torch fallback for a file-backed (spilled) layer's miss rows: pageable host
+        memory has no device alias, so the gather kernels cannot read it. Synchronous
+        staging copies with one host sync for the row count -- only ever reached from
+        the (never captured) prefill path, since spilled layers decode on the CPU
+        executor; the pages fault back from the spill file / page cache on access."""
+        assert not (self.device.type == "cuda" and torch.cuda.is_current_stream_capturing()), (
+            "spilled-layer copy during graph capture: the layer must be in cpu_layer_ids"
+        )
+        n = int(self.num_indices.item())
+        if not n:
+            return
+        src_idx = self.src_indices[:n].long()
+        dst_idx = self.evict_slots[:n].long()
+        for per_layer, cache in self.banks:
+            cache[dst_idx] = per_layer[layer_id][src_idx]
 
 
 def iter_offload_moe_layers(model) -> Iterator:

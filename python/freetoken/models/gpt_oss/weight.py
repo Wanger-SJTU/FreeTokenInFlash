@@ -258,6 +258,8 @@ def _empty_mxfp4_triton_banks(
     *,
     dtype: torch.dtype,
     tp_info=None,
+    backing=None,
+    spill_dir=None,
 ):
     """returns ``(banks, host_banks)``, unpinned. ``banks[name]`` is one ``[E, ...]``
     tensor per layer (independent allocations). host banks are lazy anon mmaps (already
@@ -285,7 +287,10 @@ def _empty_mxfp4_triton_banks(
     if torch.cuda.is_available():
         from freetoken.moe.host_banks import alloc_layer_banks
 
-        hb = alloc_layer_banks(specs, num_layers)  # lazy anon mmap -> zero-initialized, unpinned
+        # --cpu-mem: pageable layers allocate file-backed spill banks (never pinned).
+        hb = alloc_layer_banks(specs, num_layers,
+                               backing="anon" if backing is None else backing,
+                               spill_dir=spill_dir)  # lazy anon mmap -> zero-initialized, unpinned
         return {name: [b.tensor for b in hb[name]] for name in specs}, hb
     return {
         name: [torch.zeros(shape, dtype=dt) for _ in range(num_layers)]
@@ -359,6 +364,8 @@ def load_mxfp4_triton_banks_streaming(
     dtype: torch.dtype,
     tp_info=None,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """``layer_sink=None`` (serving): pin each layer as its writes complete, via an
     internally-owned :class:`PinPipeline` (or no pinning at all in the CPU-only fallback,
@@ -378,7 +385,10 @@ def load_mxfp4_triton_banks_streaming(
         world_size=tp_info.size,
     )
     tp_end = max(tp_start, tp_end)
-    banks, _hb = _empty_mxfp4_triton_banks(config, dtype=dtype, tp_info=tp_info)
+    banks, _hb = _empty_mxfp4_triton_banks(
+        config, dtype=dtype, tp_info=tp_info,
+        backing="anon" if layer_backing is None else layer_backing, spill_dir=spill_dir,
+    )
     seen: set[tuple[int, str]] = set()
     all_expert_sources = (
         "gate_up_proj_blocks",
@@ -487,6 +497,8 @@ def load_mxfp4_triton_banks_streaming_parallel(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel counterpart of load_mxfp4_triton_banks_streaming: same banks + copy plan,
     but bulk expert tensors come from the common chunked multi-threaded O_DIRECT reader.
@@ -503,7 +515,10 @@ def load_mxfp4_triton_banks_streaming_parallel(
         config.moe_intermediate_size, rank=tp_info.rank, world_size=tp_info.size
     )
     tp_end = max(tp_start, tp_end)
-    banks, _hb = _empty_mxfp4_triton_banks(config, dtype=dtype, tp_info=tp_info)
+    banks, _hb = _empty_mxfp4_triton_banks(
+        config, dtype=dtype, tp_info=tp_info,
+        backing="anon" if layer_backing is None else layer_backing, spill_dir=spill_dir,
+    )
     all_expert_sources = (
         "gate_up_proj_blocks", "gate_up_proj_scales", "gate_up_proj_bias",
         "down_proj_blocks", "down_proj_scales", "down_proj_bias",
@@ -582,6 +597,8 @@ def setup_offload_expert_banks(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ):
     from freetoken.moe.expert_banks import ExpertBanks
 
@@ -593,12 +610,13 @@ def setup_offload_expert_banks(
     elif parallel:  # parallel: common chunked multi-threaded O_DIRECT reader
         sources = load_mxfp4_triton_banks_streaming_parallel(
             model_path, model_config, dtype=dtype, tp_info=tp_info, workers=workers, chunk=chunk,
-            layer_sink=layer_sink,
+            layer_sink=layer_sink, layer_backing=layer_backing, spill_dir=spill_dir,
         )
         streamed = layer_sink is not None
     else:
         sources = load_mxfp4_triton_banks_streaming(
-            model_path, model_config, dtype=dtype, tp_info=tp_info, layer_sink=layer_sink
+            model_path, model_config, dtype=dtype, tp_info=tp_info, layer_sink=layer_sink,
+            layer_backing=layer_backing, spill_dir=spill_dir,
         )
         streamed = layer_sink is not None
     return ExpertBanks("mxfp4_triton", sources, streamed=streamed)

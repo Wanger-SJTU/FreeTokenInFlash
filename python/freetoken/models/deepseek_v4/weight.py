@@ -173,7 +173,8 @@ _EXPERT_RE = re.compile(
 
 
 def load_dsfp4_expert_sources(
-    model_path: str, args: DeepseekV4Args, *, layer_sink=None
+    model_path: str, args: DeepseekV4Args, *, layer_sink=None,
+    layer_backing: list[str] | None = None, spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build pinned CPU DeepSeek-FP4 banks for the routed experts.
 
@@ -213,7 +214,8 @@ def load_dsfp4_expert_sources(
         "down_packed": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 32), e8m0),
     }
-    hb = alloc_layer_banks(specs, L)
+    hb = alloc_layer_banks(specs, L, backing="anon" if layer_backing is None else layer_backing,
+                           spill_dir=spill_dir)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
     def _load(sink) -> int:
@@ -294,7 +296,7 @@ def _place_dsfp4(banks: dict, name: str, t: torch.Tensor, I: int) -> int:
 
 def load_dsfp4_expert_sources_parallel(
     model_path: str, args: DeepseekV4Args, *, workers: int = 8, chunk: int = 8 << 20,
-    layer_sink=None,
+    layer_sink=None, layer_backing: list[str] | None = None, spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel path: same banks as load_dsfp4_expert_sources, filled from the common
     chunked multi-threaded O_DIRECT reader instead of serial per-shard safe_open.
@@ -311,7 +313,9 @@ def load_dsfp4_expert_sources_parallel(
         "down_packed": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 32), e8m0),
     }
-    hb = alloc_layer_banks(specs, L)  # lazy host banks (unpinned)
+    # --cpu-mem: pageable layers allocate file-backed spill banks (never pinned).
+    hb = alloc_layer_banks(specs, L, backing="anon" if layer_backing is None else layer_backing,
+                           spill_dir=spill_dir)  # lazy host banks (unpinned)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
 
     def _is_expert(name: str) -> bool:

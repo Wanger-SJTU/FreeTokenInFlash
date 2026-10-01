@@ -91,7 +91,13 @@ class Qwen3_5Model(BaseOP):
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
-        if getattr(config, "lm_head_quant", "none") == "nvfp4":
+        if getattr(config, "moe_weight_format", None) == "gguf_kq":
+            # Native-GGUF checkpoint (qwen35moe): swap the dense projections for packed
+            # GGUF ops sized from the checkpoint's per-role quant types.
+            from .gguf import convert_qwen35moe_to_gguf
+
+            convert_qwen35moe_to_gguf(self, config)
+        elif getattr(config, "lm_head_quant", "none") == "nvfp4":
             # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
             # bf16 dequant of this ~1 GB matrix was the single largest decode kernel.
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead

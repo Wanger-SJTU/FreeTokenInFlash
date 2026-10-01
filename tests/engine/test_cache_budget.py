@@ -290,6 +290,7 @@ def test_engine_resolve_auto_moe_cache_size_maps_kwargs():
         max_running_req = 4
         hybrid_swa_cache_mode = "auto"
         memory_ratio = 0.9
+        gpu_mem_budget = None
         moe_prefill_overlap = True
         kv_reserve_tokens = 0
         swa_full_tokens_ratio = 0.2
@@ -480,3 +481,247 @@ def test_adjust_config_rope_gate_exempts_dsv4():
     cfg = _dsv4_adjust_cfg(max_seq_len_override=10_000_000)
     cfg.model_config.rotary_config = SimpleNamespace(max_position=1024)
     _adjust_config(cfg)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# --gpu-mem / --cpu-mem budget planning (absolute GPU budget + host residency plan)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_host_residency_pins_greedy_then_spills():
+    from freetoken.engine.cache_budget import plan_host_residency
+
+    assert plan_host_residency(4, 100, 250) == ["pinned", "pinned", "pageable", "pageable"]
+    assert plan_host_residency(4, 100, 400) == ["pinned"] * 4
+    assert plan_host_residency(4, 100, 0) == ["pageable"] * 4
+
+
+def test_plan_host_residency_no_budget_or_unknown_geometry_pins_all():
+    from freetoken.engine.cache_budget import plan_host_residency
+
+    # None budget = the historical all-pinned behavior; an unmeasurable layer size
+    # (0 bytes) must NOT silently spill everything.
+    assert plan_host_residency(3, 100, None) == ["pinned"] * 3
+    assert plan_host_residency(3, 0, 0) == ["pinned"] * 3
+
+
+def test_absolute_pool_budget_bytes_subtracts_consumed():
+    from freetoken.engine.cache_budget import absolute_pool_budget_bytes
+
+    assert absolute_pool_budget_bytes(160, 100) == 60
+    assert absolute_pool_budget_bytes(100, 160) == -60  # caller rejects negatives
+
+
+def test_resolve_auto_honors_absolute_gpu_budget():
+    # --gpu-mem 500 with weights 100 + fixed 0 -> budget 400, identical split to the
+    # ratio path with an equivalent net budget.
+    size, pages, overlap = resolve_moe_cache_auto(
+        baseline_free=10**9, weights_bytes=100, memory_ratio=0.9,  # ratio path must be ignored
+        cache_per_page=10, fixed_cache_size=0, per_expert_bytes=25,
+        num_experts=4, total_experts=8, prefill_overlap=True,
+        kv_reserve_tokens=0, page_size=1, quant_format="bf16",
+        gpu_budget=500,
+    )
+    assert size == 8  # cap at full residency (8 x 25 = 200 of the 400 budget)
+    assert pages == (400 - 8 * 25) // 10
+    assert overlap is True
+
+
+def test_resolve_auto_rejects_gpu_budget_exhausted_by_weights():
+    with pytest.raises(ValueError, match="gpu-mem budget .* exhausted"):
+        resolve_moe_cache_auto(
+            baseline_free=10**9, weights_bytes=600, memory_ratio=0.9,
+            cache_per_page=10, fixed_cache_size=50, per_expert_bytes=50,
+            num_experts=4, total_experts=8, prefill_overlap=True,
+            kv_reserve_tokens=0, page_size=1, quant_format="bf16",
+            gpu_budget=500,
+        )
+
+
+def test_startup_kv_budget_absolute_subtracts_consumed():
+    from freetoken.engine.engine import _startup_kv_budget_absolute
+
+    # --gpu-mem cap 800; 650 consumed since the pre-load baseline -> 150 left for KV.
+    assert _startup_kv_budget_absolute(800, init_free_memory=1000, new_free_memory=350) == 150
+
+
+# Per-format host-bank size estimates must match the real bank row shapes
+# (expert_bytes_per_slot over dummy sources built with the loaders' formulas) -- the
+# drift guard for --cpu-mem planning, which runs BEFORE any bank exists.
+_H, _I, _E = 128, 64, 4
+
+
+def _dummy_sources(quant: str, nvfp4_native: bool):
+    import torch
+
+    def bank(shape, dtype=torch.uint8):
+        return [torch.zeros(shape, dtype=dtype)]
+
+    if quant == "none":
+        return {
+            "gate_up": bank((_E, 2 * _I, _H), torch.bfloat16),
+            "down": bank((_E, _H, _I), torch.bfloat16),
+        }
+    if quant == "fp8_block":
+        B = 128
+        return {
+            "gate_up": bank((_E, 2 * _I, _H)),
+            "gate_up_scale": bank((_E, 2 * _I // B, _H // B), torch.bfloat16),
+            "down": bank((_E, _H, _I)),
+            "down_scale": bank((_E, _H // B, _I // B), torch.bfloat16),
+        }
+    if quant == "q4_0":
+        return {
+            "gate_up": bank((_E, 2 * _I, _H // 32 * 18)),
+            "down": bank((_E, _H, _I // 32 * 18)),
+        }
+    if quant == "nvfp4":
+        if nvfp4_native:
+            return {
+                "gate_up_packed": bank((_E, 2 * _I, _H // 2)),
+                "gate_up_scale": bank((_E, 2 * _I, _H // 16)),
+                "gate_up_global": bank((_E, 2 * _I), torch.float16),
+                "down_packed": bank((_E, _H, _I // 2)),
+                "down_scale": bank((_E, _H, _I // 16)),
+                "down_global": bank((_E, _H), torch.float16),
+            }
+        return {  # marlin/b12x: globals folded into GPU-resident alphas, not host banks
+            "gate_up_packed": bank((_E, 2 * _I, _H // 2)),
+            "gate_up_scale": bank((_E, 2 * _I, _H // 16)),
+            "down_packed": bank((_E, _H, _I // 2)),
+            "down_scale": bank((_E, _H, _I // 16)),
+        }
+    if quant == "mxfp4_triton":
+        return {
+            "gate_up_blocks": bank((_E, _H // 2, 2 * _I)),
+            "gate_up_scales": bank((_E, _H // 32, 2 * _I)),
+            "gate_up_bias": bank((_E, 2 * _I), torch.bfloat16),
+            "down_blocks": bank((_E, _I // 2, _H)),
+            "down_scales": bank((_E, _I // 32, _H)),
+            "down_bias": bank((_E, _H), torch.bfloat16),
+        }
+    if quant == "ds_fp4":
+        return {
+            "gate_up_packed": bank((_E, 2 * _I, _H // 2)),
+            "gate_up_scale": bank((_E, 2 * _I, _H // 32)),
+            "down_packed": bank((_E, _H, _I // 2)),
+            "down_scale": bank((_E, _H, _I // 32)),
+        }
+    raise AssertionError(quant)
+
+
+@pytest.mark.parametrize("quant,native", [
+    ("none", False),
+    ("fp8_block", False),
+    ("q4_0", False),
+    ("nvfp4", True),
+    ("nvfp4", False),
+    ("mxfp4_triton", False),
+    ("ds_fp4", False),
+])
+def test_estimate_layer_bank_bytes_matches_real_bank_shapes(quant, native):
+    from freetoken.engine.cache_budget import estimate_layer_bank_bytes, expert_bytes_per_slot
+
+    sources = _dummy_sources(quant, native)
+    expected = expert_bytes_per_slot(sources) * _E
+    got = estimate_layer_bank_bytes(
+        hidden_size=_H, moe_intermediate_size=_I, num_experts=_E,
+        expert_quant=quant, tp_size=1, nvfp4_native=native,
+    )
+    assert got == expected
+
+
+def test_estimate_layer_bank_bytes_applies_tp_to_intermediate():
+    from freetoken.engine.cache_budget import estimate_layer_bank_bytes
+
+    one = estimate_layer_bank_bytes(
+        hidden_size=_H, moe_intermediate_size=_I, num_experts=_E,
+        expert_quant="none", tp_size=1,
+    )
+    two = estimate_layer_bank_bytes(
+        hidden_size=_H, moe_intermediate_size=_I, num_experts=_E,
+        expert_quant="none", tp_size=2,
+    )
+    assert two == one // 2  # bf16 rows scale linearly with the sharded intermediate
+
+
+def test_estimate_layer_bank_bytes_unknown_quant_raises():
+    from freetoken.engine.cache_budget import estimate_layer_bank_bytes
+
+    with pytest.raises(ValueError, match="no host-bank size estimate"):
+        estimate_layer_bank_bytes(
+            hidden_size=_H, moe_intermediate_size=_I, num_experts=_E,
+            expert_quant="mystery", tp_size=1,
+        )
+
+
+def test_estimate_routes_gpt_oss_mxfp4_via_weight_format():
+    # gpt-oss keeps expert_quant="none" with moe_weight_format="mxfp4"; the estimate
+    # must use the mxfp4 row math (the real geometry), not the bf16 fallback -- else
+    # --cpu-mem over-reserves 3x and spills layers that would have fit.
+    from freetoken.engine.cache_budget import estimate_layer_bank_bytes
+
+    bf16 = estimate_layer_bank_bytes(
+        hidden_size=_H, moe_intermediate_size=_I, num_experts=_E, expert_quant="none",
+    )
+    mxfp4 = estimate_layer_bank_bytes(
+        hidden_size=_H, moe_intermediate_size=_I, num_experts=_E, expert_quant="none",
+        moe_weight_format="mxfp4",
+    )
+    direct = estimate_layer_bank_bytes(
+        hidden_size=_H, moe_intermediate_size=_I, num_experts=_E,
+        expert_quant="mxfp4_triton",
+    )
+    assert mxfp4 == direct
+    assert mxfp4 < bf16 // 2
+
+
+def test_net_cache_budget_absolute_mode_ignores_ratio_and_baseline():
+    from freetoken.engine.cache_budget import net_cache_budget_bytes
+
+    # --gpu-mem: the ratio/baseline terms are inert; budget = cap - weights - fixed.
+    assert net_cache_budget_bytes(0.9, 10**10, 100, 50, gpu_budget=1000) == 850
+    # without a budget the historical ratio math is untouched
+    assert net_cache_budget_bytes(0.9, 1000, 100, 50) == 750
+
+
+def test_validate_rebuild_fit_check_honors_gpu_budget():
+    """A rebuild target that fits the RATIO budget but exceeds the --gpu-mem cap must
+    reject: the fit-check's budget is the absolute cap, not ratio x baseline."""
+    from freetoken.kvcache.base import CacheRebuildRejected
+    from freetoken.kvcache.mha_pool import MHAKVCache
+    from freetoken.models.config import KVCacheGroupSpec
+
+    class StubModelConfig:
+        has_swa_attention = False
+
+        def kv_cache_group_specs(self):
+            return [KVCacheGroupSpec(
+                name="full", layer_ids=(0, 1), num_kv_heads=8, head_dim=64, sliding_window=None,
+            )]
+
+        def linear_attention_group(self):
+            return None
+
+    class StubConfig:
+        dtype = torch.float16
+        page_size = 1
+        max_running_req = 4
+        swa_full_tokens_ratio = 0.2
+        swa_num_pages_override = None
+        memory_ratio = 1.0  # ratio budget would be the whole (huge) baseline
+        gpu_mem_budget = 10_000_000  # ... but the absolute cap is small
+        model_config = StubModelConfig()
+
+        class tp_info:
+            size = 1
+
+    cache_per_page, _, _, _ = MHAKVCache.kv_cost(StubConfig())
+    target_pages = 12_000_000 // cache_per_page  # KV bytes ~12MB > the 10MB absolute cap
+
+    with pytest.raises(CacheRebuildRejected, match="old cache kept"):
+        MHAKVCache.validate_rebuild(
+            MHAKVCache.__new__(MHAKVCache), StubConfig(),
+            num_pages=target_pages, target_moe=0, per_expert_bytes=0,
+            baseline_free=10**9, weights_bytes=0, current_num_pages=1,
+        )

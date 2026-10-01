@@ -174,6 +174,34 @@ def cache_status_rows(geometry: dict) -> List[Tuple[str, str, int, str]]:
     return rows
 
 
+def format_host_lines(geometry: dict) -> List[str]:
+    """The host tier of the expert cache (--gpu-mem/--cpu-mem budgets + the pinned/spilled
+    layer split), as extra lines under the pool table. Empty when the server reported no
+    host section (older engine, or no budget in play -- the report stays as it was)."""
+    host = (geometry or {}).get("host")
+    if not isinstance(host, dict):
+        return []
+    gpu_budget = _int(host, "gpu_budget_bytes")
+    cpu_budget = _int(host, "cpu_budget_bytes")
+    pinned = _int(host, "pinned_layers")
+    spilled = _int(host, "spilled_layers")
+    if gpu_budget <= 0 and cpu_budget <= 0 and spilled <= 0:
+        return []
+    lines = []
+    if gpu_budget > 0:
+        lines.append(f"  host: gpu budget {format_bytes(gpu_budget)} (weights + pools)")
+    if cpu_budget > 0 or spilled > 0:
+        parts = [f"expert banks pinned {pinned} layers"]
+        if spilled > 0:
+            parts.append(
+                f"spilled {spilled} layers (page-cache backed, CPU-executor decode)"
+            )
+        if cpu_budget > 0:
+            parts.append(f"budget {format_bytes(cpu_budget)}")
+        lines.append("  host: " + ", ".join(parts))
+    return lines
+
+
 def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
     """The served geometry as a table -- one row per pool the model has, carrying its size, the
     VRAM it holds, and the range a rebuild would accept -- under a header with the maintenance
@@ -215,4 +243,5 @@ def format_cache_status(doc: dict, *, prefix: str = "cache: ") -> str:
     return "\n".join(
         [header]
         + ["  " + "  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip() for row in table]
+        + format_host_lines(geometry)
     )

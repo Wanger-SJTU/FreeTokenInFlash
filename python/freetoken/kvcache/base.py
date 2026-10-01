@@ -108,6 +108,7 @@ class BaseKVCachePool(ABC):
         budget = net_cache_budget_bytes(
             config.memory_ratio, baseline_free, weights_bytes,
             fixed_cache_size + extra_fixed_bytes,
+            gpu_budget=getattr(config, "gpu_mem_budget", None),
         )
         need = required_bytes(target_moe, target_pages, per_expert_bytes, cache_per_page)
         if need > budget:

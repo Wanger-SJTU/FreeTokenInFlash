@@ -402,7 +402,8 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
 
 
 def load_ftw_banks(
-    path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK
+    path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
+    layer_backing: list[str] | None = None, spill_dir: str | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one pinned ``[num_experts, ...]``
@@ -476,6 +477,13 @@ def load_ftw_banks(
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
     layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
 
+    def _bank_for_layer(shape, layer_id: int, *, dtype=torch.uint8) -> HostBank:
+        # --cpu-mem plan: pageable layers get file-backed spill banks (never pinned; the
+        # PinPipeline drops their pages after fill and accesses re-fault from disk).
+        if layer_backing is not None and layer_backing[layer_id] != "pinned":
+            return HostBank(shape, dtype, backing="file", spill_dir=spill_dir)
+        return HostBank(shape, dtype)
+
     for e in flat_entries:
         name = e["name"]
         total, *row_shape = e["shape"]
@@ -492,7 +500,7 @@ def load_ftw_banks(
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off
-            bank = HostBank((win_end - win_off,), torch.uint8)
+            bank = _bank_for_layer((win_end - win_off,), layer_id)
             row_hb[name].append(bank)
             row_view_args[name].append((head_pad, layer_bytes, num_experts, tuple(row_shape), dtype))
             row_jobs.append((name, bank, win_off, win_end - win_off, layer_bytes))
@@ -507,7 +515,7 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]))
+            bank = _bank_for_layer(tuple(e["shape"]), layer_id, dtype=_dtype_of(e["dtype"]))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
             layer_jobs.append((base, bank, e))

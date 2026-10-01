@@ -44,11 +44,12 @@ def _bank_layer(spec: Nvfp4ExpertSourceSpec, layer: int, config) -> int | None:
     return bank_layer
 
 
-def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
+def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int, backing=None, spill_dir=None):
     """6 NVFP4 source banks, one ``[E, ...]`` tensor per layer (independent allocations),
     unpinned (pin-after-fill): register only after fill to skip cudaHostAlloc's slow
     commit. Caller fills each layer's ``.tensor`` then pins it (per-layer, via
-    ``PinPipeline``, as its writes complete)."""
+    ``PinPipeline``, as its writes complete). ``backing`` (--cpu-mem): per-layer
+    ``"pinned"``/``"pageable"`` plan; pageable layers allocate file-backed spill banks."""
     from freetoken.moe.host_banks import alloc_layer_banks
 
     fp8 = torch.float8_e4m3fn
@@ -59,7 +60,7 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
         "down_packed": ((E, H, I // 2), torch.uint8),
         "down_scale": ((E, H, I // 16), fp8),
         "down_global": ((E, H), torch.float16),
-    }, num_layers)
+    }, num_layers, backing=backing if backing is not None else "anon", spill_dir=spill_dir)
 
 
 def load_nvfp4_expert_source_banks(
@@ -70,6 +71,8 @@ def load_nvfp4_expert_source_banks(
     drop_page_cache: DropPageCache,
     primary: bool,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Build the 6 native NVFP4 source banks by streaming checkpoint shards (serial per-shard read).
 
@@ -133,7 +136,7 @@ def load_nvfp4_expert_source_banks(
                 globals_map[key] = f.get_tensor(name).to(torch.float16)
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I, backing=layer_backing, spill_dir=spill_dir)  # unpinned; pinned/dropped after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]
@@ -211,6 +214,8 @@ def load_nvfp4_expert_source_banks_parallel(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """parallel counterpart of :func:`load_nvfp4_expert_source_banks`, byte-for-byte same
     placement. bulk weight/weight_scale read via chunked multi-threaded O_DIRECT reader
@@ -257,7 +262,7 @@ def load_nvfp4_expert_source_banks_parallel(
                 )
         drop_page_cache(path)
 
-    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I)  # unpinned; pinned after fill
+    _hb = _alloc_nvfp4_host_banks(num_layers, E, H, I, backing=layer_backing, spill_dir=spill_dir)  # unpinned; pinned/dropped after fill
     gate_up_packed = [b.tensor for b in _hb["gate_up_packed"]]
     gate_up_scale = [b.tensor for b in _hb["gate_up_scale"]]
     gate_up_global = [b.tensor for b in _hb["gate_up_global"]]

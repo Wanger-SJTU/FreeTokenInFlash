@@ -29,12 +29,22 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
 
 
 def net_cache_budget_bytes(
-    memory_ratio: float, baseline_free: int, weights_bytes: int, fixed_cache_size: int
+    memory_ratio: float,
+    baseline_free: int,
+    weights_bytes: int,
+    fixed_cache_size: int,
+    gpu_budget: int | None = None,
 ) -> int:
     """Net GPU bytes available for the MoE + KV pools: ``memory_ratio`` of the pre-model
     baseline minus weights and fixed (non-paged) cache. The ``(1-memory_ratio)`` remainder
     is the CUDA-graph/activation headroom. Single source of truth for startup auto-sizing
-    and the runtime-rebuild fit check."""
+    and the runtime-rebuild fit check.
+
+    ``gpu_budget`` (--gpu-mem absolute mode) replaces the ratio term: the budget is the
+    absolute cap minus weights + fixed, ignoring baseline/ratio (graphs/activations sit
+    on top of the cap)."""
+    if gpu_budget is not None:
+        return int(gpu_budget) - int(weights_bytes) - int(fixed_cache_size)
     return int(memory_ratio * baseline_free) - weights_bytes - fixed_cache_size
 
 
@@ -95,6 +105,95 @@ def plan_cache_budget(
     return moe_cache_size, num_pages, overlap
 
 
+def absolute_pool_budget_bytes(gpu_budget: int, consumed_bytes: int) -> int:
+    """Net bytes left of an ABSOLUTE GPU budget (--gpu-mem) after everything already
+    consumed. ``consumed_bytes`` is measured the same way the ratio path measures
+    ``ratio * baseline_free``: for the MoE/KV split it is weights + fixed cache; for the
+    startup KV solve it is everything allocated since the pre-load baseline. The
+    (negative -> invalid) result is the caller's to reject with a readable message."""
+    return int(gpu_budget) - int(consumed_bytes)
+
+
+def plan_host_residency(
+    num_layers: int, layer_bytes: int, budget_bytes: int | None
+) -> list[str]:
+    """Greedy per-layer host residency plan for --cpu-mem: pin layers in id order until
+    the budget is exhausted, then spill the rest to file-backed (page-cache-paged) banks.
+
+    Returns ``HostResidency``-compatible values ("pinned"/"pageable"); ``budget_bytes``
+    None (unset) pins everything -- today's behavior. ``layer_bytes <= 0`` (unknown
+    geometry) also pins everything: an unmeasurable budget must not silently spill.
+    """
+    if budget_bytes is None or layer_bytes <= 0:
+        return ["pinned"] * num_layers
+    plan = []
+    remaining = int(budget_bytes)
+    for _ in range(num_layers):
+        if remaining >= layer_bytes:
+            plan.append("pinned")
+            remaining -= layer_bytes
+        else:
+            plan.append("pageable")
+    return plan
+
+
+def estimate_layer_bank_bytes(
+    *,
+    hidden_size: int,
+    moe_intermediate_size: int,
+    num_experts: int,
+    expert_quant: str,
+    tp_size: int = 1,
+    nvfp4_native: bool = False,
+    moe_weight_format: str | None = None,
+) -> int:
+    """Bytes ONE MoE layer's host banks occupy (all experts, all banks of the format),
+    for --cpu-mem planning BEFORE the banks are loaded.
+
+    Mirrors the per-format row shapes of ``_BANK_SCHEMAS`` (offload_cache) / the weight
+    loaders; ``tests/engine/test_cache_budget.py`` pins every format against
+    ``expert_bytes_per_slot`` on dummy banks so the two cannot drift. TP shards the
+    intermediate dim (``div_even``, the loaders' convention); gpt-oss's mxfp4 uses its
+    own TP range split, so its estimate is approximate by up to one block per rank.
+    ``nvfp4_native`` selects the 6-bank native layout the loaders produce for
+    decode_target=="cpu" (the layout a --cpu-mem split forces); the marlin/b12x
+    alternatives fold their globals into GPU-resident alphas and are smaller -- plan
+    against the native layout whenever a budget is active (conservative).
+
+    gpt-oss keeps its quant on ``moe_weight_format`` (``expert_quant`` stays "none"),
+    so callers pass both; "none" + mxfp4 resolves to the mxfp4 row math, not bf16.
+    """
+    from freetoken.utils import div_even
+
+    if expert_quant == "none" and (moe_weight_format or None) == "mxfp4":
+        expert_quant = "mxfp4_triton"
+    H, I = hidden_size, div_even(moe_intermediate_size, tp_size)
+    E = num_experts
+    if expert_quant == "none":
+        per_expert = (2 * I * H + H * I) * 2  # bf16 gate_up [2I, H] + down [H, I]
+    elif expert_quant == "fp8_block":
+        B = 128
+        per_expert = (2 * I * H + H * I) * 1 + (
+            (2 * I // B) * (H // B) + (H // B) * (I // B)
+        ) * 2
+    elif expert_quant == "q4_0":
+        # packed 4-bit blocks: 18 bytes per 32 elements, per output row
+        per_expert = 2 * I * (H // 32 * 18) + H * (I // 32 * 18)
+    elif expert_quant == "nvfp4":
+        globals_bytes = (2 * I + H) * 2 if nvfp4_native else 0
+        per_expert = 2 * I * (H // 2 + H // 16) + H * (I // 2 + I // 16) + globals_bytes
+    elif expert_quant == "mxfp4_triton":
+        # bias banks are bf16 (2 B/row-element); packed blocks and e8m0 scales are 1 B
+        per_expert = (
+            2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2)
+        )
+    elif expert_quant == "ds_fp4":
+        per_expert = 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32)
+    else:
+        raise ValueError(f"no host-bank size estimate for expert_quant={expert_quant!r}")
+    return per_expert * E
+
+
 def resolve_moe_cache_auto(
     *,
     baseline_free: int,
@@ -109,14 +208,26 @@ def resolve_moe_cache_auto(
     kv_reserve_tokens: int,
     page_size: int,
     quant_format: str,
+    gpu_budget: int | None = None,
 ) -> tuple[int, int, bool]:
     """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
-    Applies memory_ratio to the persisted pre-model baseline exactly once, then defers
-    the MoE-vs-KV split to plan_cache_budget. The (1-memory_ratio) remainder is the
-    CUDA-graph/activation headroom (not subtracted here).
+    Applies memory_ratio to the persisted pre-model baseline exactly once (or, with
+    ``gpu_budget`` set -- the --gpu-mem absolute budget -- takes weights + fixed out of
+    the absolute cap instead), then defers the MoE-vs-KV split to plan_cache_budget. The
+    (1-memory_ratio) remainder is the CUDA-graph/activation headroom (not subtracted
+    here); under an absolute budget graphs/activations sit on top of the cap.
     """
-    budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
+    if gpu_budget is not None:
+        budget_bytes = absolute_pool_budget_bytes(gpu_budget, weights_bytes + fixed_cache_size)
+        if budget_bytes <= 0:
+            raise ValueError(
+                f"--gpu-mem budget ({gpu_budget} B) is exhausted by the resident weights "
+                f"({weights_bytes} B) + fixed cache ({fixed_cache_size} B); raise the "
+                "budget or free GPU memory"
+            )
+    else:
+        budget_bytes = net_cache_budget_bytes(memory_ratio, baseline_free, weights_bytes, fixed_cache_size)
     max_slots = 992 if quant_format == "nvfp4_marlin" else total_experts
     kv_reserve_pages = div_ceil(kv_reserve_tokens, page_size)
     return plan_cache_budget(

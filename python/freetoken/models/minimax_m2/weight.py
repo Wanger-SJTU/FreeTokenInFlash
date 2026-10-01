@@ -93,6 +93,8 @@ def load_nvfp4_expert_sources(
     config,
     *,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """CPU NVFP4 expert source banks for the offload cache; see load_nvfp4_expert_source_banks."""
     return load_nvfp4_expert_source_banks(
@@ -102,11 +104,15 @@ def load_nvfp4_expert_sources(
         drop_page_cache=drop_page_cache,
         primary=get_tp_info().is_primary(),
         layer_sink=layer_sink,
+        layer_backing=layer_backing,
+        spill_dir=spill_dir,
     )
 
 
 def load_nvfp4_expert_sources_parallel(
-    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None
+    model_path: str, config, *, workers: int = 8, chunk: int = 8 << 20, layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ):
     """parallel: same NVFP4 source banks via the common chunked multi-threaded O_DIRECT reader."""
     from freetoken.models.nvfp4_banks import load_nvfp4_expert_source_banks_parallel
@@ -120,6 +126,8 @@ def load_nvfp4_expert_sources_parallel(
         workers=workers,
         chunk=chunk,
         layer_sink=layer_sink,
+        layer_backing=layer_backing,
+        spill_dir=spill_dir,
     )
 
 

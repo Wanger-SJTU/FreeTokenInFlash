@@ -109,6 +109,19 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be >= 1")
         return n
 
+    def _parse_mem_arg(value: str) -> int:
+        from freetoken.env import parse_mem_bytes
+
+        try:
+            n = parse_mem_bytes(value)
+        except Exception as exc:
+            raise argparse.ArgumentTypeError(
+                f"invalid memory size {value!r} (use 16G / 512M / bare bytes)"
+            ) from exc
+        if n <= 0:
+            raise argparse.ArgumentTypeError("memory size must be positive")
+        return n
+
     def _infer_tool_call_parser(model_path: str) -> str:
         try:
             from freetoken.utils import cached_load_hf_config
@@ -243,13 +256,51 @@ def parse_args(
         help="Default max output tokens for requests that omit one (default 32k).",
     )
 
-    parser.add_argument(
+    gpu_memory_group = parser.add_mutually_exclusive_group()
+    gpu_memory_group.add_argument(
         "--memory-ratio",
         type=float,
         default=ServerArgs.memory_ratio,
         help=(
             "Fraction of total GPU free memory the engine may use for weights + MoE "
             "cache + KV cache combined; the remainder is reserved runtime headroom."
+        ),
+    )
+    gpu_memory_group.add_argument(
+        "--gpu-mem",
+        dest="gpu_mem_budget",
+        type=_parse_mem_arg,
+        default=ServerArgs.gpu_mem_budget,
+        help=(
+            "Absolute GPU memory budget (e.g. 16G, 512M, bare bytes): weights + MoE "
+            "expert slots + KV pools together must fit under it (the pools auto-shrink "
+            "to match; MoE gets priority). CUDA graphs and activations sit on top. "
+            "Mutually exclusive with --memory-ratio."
+        ),
+    )
+
+    parser.add_argument(
+        "--cpu-mem",
+        dest="cpu_mem_budget",
+        type=_parse_mem_arg,
+        default=ServerArgs.cpu_mem_budget,
+        help=(
+            "Host RAM budget (e.g. 32G) bounding the PINNED expert banks (offload "
+            "backends). MoE layers are pinned in id order until the budget is used up; "
+            "the rest load as file-backed spill banks (RAM-capped by the OS page cache) "
+            "and decode on the CPU executor. Unset = pin every layer (default)."
+        ),
+    )
+
+    parser.add_argument(
+        "--cpu-mem-spill-dir",
+        dest="cpu_mem_spill_dir",
+        type=str,
+        default=ServerArgs.cpu_mem_spill_dir,
+        help=(
+            "Directory for --cpu-mem spill files (default: the model directory). The "
+            "files are unlinked immediately; their disk space (~ the unpinned expert "
+            "bytes) is freed when the server exits."
         ),
     )
 

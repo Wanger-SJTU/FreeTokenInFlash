@@ -69,6 +69,13 @@ def _startup_kv_budget(memory_ratio: float, init_free_memory: int, new_free_memo
     return int(memory_ratio * init_free_memory) - (init_free_memory - new_free_memory)
 
 
+def _startup_kv_budget_absolute(gpu_budget: int, init_free_memory: int, new_free_memory: int) -> int:
+    """--gpu-mem variant of :func:`_startup_kv_budget`: the absolute cap minus everything
+    consumed since the pre-load baseline (weights, MoE slots, page table, ...). Pure for
+    the same testability reason."""
+    return int(gpu_budget) - (init_free_memory - new_free_memory)
+
+
 def _page_table_width(max_seq_len: int, page_size: int) -> int:
     """Column count for the page table. ``_write_page_table`` writes WHOLE trailing pages, so the
     highest column touched is ``align_ceil(max_seq_len, page_size) - 1`` -- which the 32-alignment
@@ -340,7 +347,20 @@ class Engine:
         new_free = self._sync_get_memory()[1]
         # The engine measures the budget and settles the sibling GDN state pool's bytes
         # off it; the KV pool family owns every geometry-specific formula behind the rest.
-        available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        if config.gpu_mem_budget is not None:
+            available_memory = _startup_kv_budget_absolute(
+                config.gpu_mem_budget, init_free_memory, new_free
+            )
+        else:
+            available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
+        if available_memory <= 0:
+            if config.gpu_mem_budget is not None:
+                raise ValueError(
+                    f"--gpu-mem budget {mem_GB(config.gpu_mem_budget)} is exhausted before "
+                    f"the KV pool: {mem_GB(init_free_memory - new_free)} consumed by "
+                    "weights + MoE slots; raise the budget or free GPU memory"
+                )
+            raise ValueError("no GPU memory left for the KV cache after the model loaded")
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
         num_tokens = self.num_pages * config.page_size
@@ -390,6 +410,19 @@ class Engine:
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
+        if config.gpu_mem_budget is not None:
+            used = init_free_memory - post_free_memory
+            if used > config.gpu_mem_budget:
+                logger.warning_rank0(
+                    f"GPU usage {mem_GB(used)} exceeds the --gpu-mem budget "
+                    f"{mem_GB(config.gpu_mem_budget)} (CUDA graphs and activation "
+                    "buffers sit on top of the weights + pools the budget caps)"
+                )
+            else:
+                logger.info_rank0(
+                    f"GPU usage {mem_GB(used)} of the --gpu-mem budget "
+                    f"{mem_GB(config.gpu_mem_budget)}"
+                )
 
         # ======================= Graph capture initialization ========================
         self.dummy_req = Req(
@@ -491,7 +524,48 @@ class Engine:
             kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
+            gpu_budget=config.gpu_mem_budget,
         )
+
+    def _plan_host_residency(self, config: EngineConfig) -> tuple[list[str] | None, str | None]:
+        """--cpu-mem plan: per-layer ``"pinned"``/``"pageable"`` for the expert host banks.
+
+        None when no budget is set (every layer pinned -- the historical behavior). The
+        plan runs BEFORE the bank load: spilled (pageable) layers allocate file-backed
+        spill banks, decode on the CPU executor, and -- for nvfp4 -- flip the bank layout
+        to the CPU-readable native one, so the estimate plans on native bytes whenever a
+        budget is active (conservative for the smaller marlin/b12x layouts, exact once any
+        layer spills)."""
+        if config.cpu_mem_budget is None:
+            return None, None
+        from freetoken.engine.cache_budget import estimate_layer_bank_bytes, plan_host_residency
+
+        mc = config.model_config
+        num_moe_layers = mc.num_moe_layers
+        layer_bytes = estimate_layer_bank_bytes(
+            hidden_size=mc.hidden_size,
+            moe_intermediate_size=getattr(mc, "moe_intermediate_size", 0),
+            num_experts=mc.num_experts,
+            expert_quant=mc.expert_quant,
+            tp_size=config.tp_info.size,
+            nvfp4_native=True,
+            moe_weight_format=getattr(mc, "moe_weight_format", None),
+        )
+        plan = plan_host_residency(num_moe_layers, layer_bytes, config.cpu_mem_budget)
+        spill_dir = config.cpu_mem_spill_dir or config.model_path
+        pinned = plan.count("pinned")
+        if pinned == num_moe_layers:
+            logger.info_rank0(
+                f"--cpu-mem {mem_GB(config.cpu_mem_budget)}: all {num_moe_layers} MoE "
+                f"layers pinned (~{mem_GB(layer_bytes)} per layer)"
+            )
+        else:
+            logger.info_rank0(
+                f"--cpu-mem {mem_GB(config.cpu_mem_budget)}: pinning {pinned}/{num_moe_layers} "
+                f"MoE layers (~{mem_GB(layer_bytes)} per layer); the rest spill to file-backed "
+                f"banks under {spill_dir!r} and decode on the CPU executor"
+            )
+        return plan, spill_dir
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -503,15 +577,34 @@ class Engine:
                 "--moe-cache-auto is not supported for models with a custom "
                 "make_offload_moe_cache; pass --moe-cache-size explicitly."
             )
+        if cache_factory is not None and config.cpu_mem_budget is not None:
+            raise ValueError(
+                "--cpu-mem is not supported for models with a custom "
+                "make_offload_moe_cache (the model owns its bank loading)."
+            )
+        # --cpu-mem first: spilled layers join the CPU-decode set, and the (possibly
+        # larger) cpu_layer_ids set decides the decode target + native bank layout.
+        layer_backing, spill_dir = self._plan_host_residency(config)
         # decode_target picks the bank layout + the per-decode mechanism:
         #   "hybrid" -> GPU-cache + CPU-overflow co-compute, every layer (--moe-backend hybrid);
         #   "cpu"    -> CPU executor for the cpu_layer_ids set (all layers under --moe-backend
-        #               cpu, the --moe-cpu-layers subset under offload);
+        #               cpu, the --moe-cpu-layers subset under offload, the --cpu-mem spilled
+        #               layers under any offload backend);
         #   "gpu"    -> plain GPU offload.
         # cpu/hybrid both read experts on the CPU, so banks load in the native (CPU-readable)
         # layout; the GPU slot-cache GEMM reads those same native rows. decode_target also
         # gates the CPU executor build below.
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
+        if layer_backing is not None:
+            spilled = {l for l, b in enumerate(layer_backing) if b != "pinned"}
+            if spilled and not _cpu_executor_supports_act(config.model_config):
+                raise ValueError(
+                    f"--cpu-mem: {len(spilled)} MoE layer(s) spill past the host budget and "
+                    "decode on the CPU executor, which does not support this model's expert "
+                    f"activation {getattr(config.model_config, 'hidden_act', None)!r}; raise "
+                    "--cpu-mem to pin every layer or drop the flag"
+                )
+            cpu_layer_ids = frozenset(cpu_layer_ids | spilled)
         if config.moe_backend == "hybrid":
             decode_target = "hybrid"
         elif cpu_layer_ids:
@@ -533,6 +626,8 @@ class Engine:
                 dummy=config.use_dummy_weight,
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
+                layer_backing=layer_backing,
+                spill_dir=spill_dir,
             )
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
@@ -1071,6 +1166,19 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int) -> frozenset[
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
+# Activations the CPU MoE executor can compute (csrc ActKind; "gpt_oss_swiglu" rides
+# inside the mxfp4 kernel and swigluoai the generic GEMV epilogue). hidden_act (the dense
+# activation) stands proxy for the expert activation -- true for every in-tree model;
+# mxfp4 experts pass regardless: their act runs inside the mxfp4 kernel, not the generic
+# epilogue.
+_CPU_MOE_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai")
+
+
+def _cpu_executor_supports_act(model_config) -> bool:
+    act = getattr(model_config, "hidden_act", "silu")
+    return act in _CPU_MOE_ACTS or getattr(model_config, "moe_weight_format", None) == "mxfp4"
+
+
 # MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled
 # separately (its dense value is 'fused', but 'auto' resolves there without a warning).
 _DENSE_MOE_SETTINGS = {
@@ -1083,6 +1191,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_prefill_overlap": True,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
+    "cpu_mem_budget": None,
 }
 
 
@@ -1200,15 +1309,7 @@ def _adjust_config(config: EngineConfig):
     # swigluoai the generic GEMV epilogue). A model with any other expert
     # activation cannot decode on the CPU: reject an explicit cpu/hybrid pick at
     # config time, and keep auto from upgrading offload -> hybrid off the profile.
-    _cpu_moe_acts = (
-        "silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swigluoai",
-    )
-    # hidden_act (the dense activation) stands proxy for the expert activation --
-    # true for every in-tree model. mxfp4 experts pass regardless: their act runs
-    # inside the mxfp4 kernel, not the generic epilogue.
-    _cpu_moe_act_ok = getattr(model_config, "hidden_act", "silu") in _cpu_moe_acts or (
-        getattr(model_config, "moe_weight_format", None) == "mxfp4"
-    )
+    _cpu_moe_act_ok = _cpu_executor_supports_act(model_config)
     if (
         is_moe
         and not _cpu_moe_act_ok
@@ -1313,6 +1414,12 @@ def _adjust_config(config: EngineConfig):
             override("moe_cache_size", 0)
             override("moe_cache_rate", None)
             override("moe_cache_auto", False)
+        if config.cpu_mem_budget is not None:
+            logger.warning_rank0(
+                "MoE backend 'fused' keeps its experts on the GPU; ignoring --cpu-mem "
+                "(it bounds the host-side expert banks of the offload backends)"
+            )
+            override("cpu_mem_budget", None)
 
     if is_moe and config.moe_backend == "cpu":
         # CPU-compute decode keeps experts in host RAM and computes them on the CPU;

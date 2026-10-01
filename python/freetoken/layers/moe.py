@@ -531,6 +531,16 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "gguf_kq":
+            # Native GGUF K-quant experts (qwen35moe GGUF, e.g. Q4_K gate_up + Q5_K
+            # down): same MMVQ flow, each bank's type inferred from its row length.
+            from freetoken.moe.fused_q4_0 import fused_experts_gguf_kq
+
+            gate_up, down = views
+            return fused_experts_gguf_kq(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation,
+                hidden_size=self.hidden_size, intermediate_size=self.intermediate_size,
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

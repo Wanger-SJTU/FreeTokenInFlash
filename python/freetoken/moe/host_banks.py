@@ -22,6 +22,7 @@ import math
 import mmap
 import os
 import queue
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -40,11 +41,24 @@ class HostResidency(str, Enum):
     ``PAGEABLE`` are reserved for platforms where the pin quota cannot cover every
     layer (Windows/WDDM); their movement paths are not implemented here -- layers
     with either class must be served by the CPU executor.
+
+    ``PAGEABLE`` layers produced by a --cpu-mem budget are FILE-BACKED (spill
+    tmpfile + shared mmap): touching a dropped page faults it back from disk, so
+    the kernel's page cache pages them in and out on demand. The CPU executor is
+    their only reader.
     """
 
     PINNED = "pinned"
     LOCKED = "locked"
     PAGEABLE = "pageable"
+
+
+# HostBank backing stores. "anon" is the classic lazy anonymous mmap (pin-able,
+# contents undefined after release). "file" is a shared mmap over an unlinked
+# spill tmpfile: MADV_DONTNEED'd pages re-fault from the file, so the OS page
+# cache -- not the pin quota -- governs how much RAM the bank's layer holds.
+ANON_BACKING = "anon"
+FILE_BACKING = "file"
 
 
 _DEFAULT_CHUNK = 8 << 20
@@ -58,15 +72,32 @@ class HostBank:
 
     Allocate -> fill (write real data, or O_DIRECT read into it) -> ``pin()``. The mmap is
     rounded up to the O_DIRECT block so chunked reads are always aligned; ``tensor`` views
-    exactly ``nbytes``."""
+    exactly ``nbytes``.
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned")
+    ``backing="file"`` allocates over an unlinked spill tmpfile in ``spill_dir`` instead
+    of anonymous memory (the --cpu-mem budget's over-budget layers): the buffer is never
+    pinned; after filling, ``drop_pages()`` returns the pages to the OS and any later
+    access faults them back from the file, so resident RAM tracks the page cache rather
+    than the bank's size."""
 
-    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "backing")
+
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        backing: str = ANON_BACKING,
+        spill_dir: str | None = None,
+    ):
+        assert backing in (ANON_BACKING, FILE_BACKING), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
-        self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+        self.backing = backing
+        if backing == ANON_BACKING:
+            self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
+        else:
+            self._buf = _mmap_spill_tmpfile(asize, spill_dir)
         _LIVE_BUFFERS.append(self._buf)
         self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
@@ -81,6 +112,10 @@ class HostBank:
 
     def pin(self) -> None:
         """cudaHostRegister the (now-filled, resident) buffer -- pin-after-fill."""
+        assert self.backing == ANON_BACKING, (
+            "file-backed (spilled) banks must never be registered: the GPU movement "
+            "paths cannot dereference them and pinning would defeat the RAM budget"
+        )
         if self._pinned:
             return
         from freetoken.kernel.pinned import host_register
@@ -92,6 +127,14 @@ class HostBank:
                 f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB"
             ) from exc
         self._pinned = True
+
+    def drop_pages(self) -> None:
+        """Return the buffer's resident pages to the OS. FILE-BACKED banks only: the
+        (already written) pages live in the page cache / spill file, so later access
+        re-faults the same data. This is the after-fill step that replaces pin() for
+        over-budget layers."""
+        assert self.backing == FILE_BACKING, "drop_pages is only meaningful for file-backed banks"
+        self._buf.madvise(mmap.MADV_DONTNEED)
 
     def release(self) -> None:
         """Drop the buffer's resident pages (address space stays valid; contents
@@ -110,29 +153,79 @@ class HostBank:
         raise NotImplementedError("HostBank.lock() is platform-specific and not implemented")
 
 
-def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
+def _mmap_spill_tmpfile(asize: int, spill_dir: str | None) -> mmap.mmap:
+    """Shared mmap over an unlinked spill tmpfile: pages the kernel drops are re-faulted
+    from disk, so the bank caps at the page cache instead of pinned/committed anon RAM.
+    Unlinking immediately hands the space back at process exit; the mapping itself keeps
+    the storage alive (POSIX semantics)."""
+    import platform
+
+    if platform.system() != "Linux":
+        raise NotImplementedError(
+            "file-backed host banks (--cpu-mem spill) are Linux-only (MADV_DONTNEED "
+            "on a shared mapping)"
+        )
+    fd, path = tempfile.mkstemp(prefix="freetoken_expert_", suffix=".spill", dir=spill_dir)
+    try:
+        os.ftruncate(fd, asize)
+        buf = mmap.mmap(fd, asize, flags=mmap.MAP_SHARED)
+    finally:
+        os.close(fd)
+        os.unlink(path)  # storage survives until the mapping closes (process lifetime)
+    return buf
+
+
+def alloc_banks(
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    backing: str = ANON_BACKING,
+    spill_dir: str | None = None,
+) -> dict[str, HostBank]:
     """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
-    return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
+    return {name: HostBank(shape, dtype, backing=backing, spill_dir=spill_dir) for name, (shape, dtype) in specs.items()}
 
 
 def alloc_layer_banks(
-    specs: dict[str, tuple[tuple[int, ...], torch.dtype]], num_layers: int
+    specs: dict[str, tuple[tuple[int, ...], torch.dtype]],
+    num_layers: int,
+    backing: list[str] | str = ANON_BACKING,
+    spill_dir: str | None = None,
 ) -> dict[str, list[HostBank]]:
     """Allocate per-layer host banks: ``{name: ([num_experts, ...] row shape, dtype)}``
     -> one independently allocated (page-aligned, independently pin/lock-able)
-    ``HostBank`` per layer per name."""
+    ``HostBank`` per layer per name.
+
+    ``backing`` is either a constant or a ``num_layers``-long list of per-layer values:
+    ``"pinned"`` layers get pin-able anonymous banks, anything else (the budget plan's
+    ``"pageable"``) gets file-backed spill banks whose pages the kernel pages on demand."""
+    per_layer = [backing] * num_layers if isinstance(backing, str) else list(backing)
+    assert len(per_layer) == num_layers, (len(per_layer), num_layers)
     return {
-        name: [HostBank(shape, dtype) for _ in range(num_layers)]
+        name: [
+            HostBank(
+                shape,
+                dtype,
+                backing=ANON_BACKING if b == "pinned" else FILE_BACKING,
+                spill_dir=spill_dir,
+            )
+            for b in per_layer
+        ]
         for name, (shape, dtype) in specs.items()
     }
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank]]) -> None:
-    """Pin (register) every bank after it has been filled -- pin-after-fill."""
+    """Pin (register) every anonymous bank after it has been filled -- pin-after-fill.
+    File-backed (spilled) banks are dropped instead: their after-fill step returns the
+    pages to the page cache."""
     for bank in banks.values():
         if isinstance(bank, list):
             for layer_bank in bank:
-                layer_bank.pin()
+                if layer_bank.backing == FILE_BACKING:
+                    layer_bank.drop_pages()
+                else:
+                    layer_bank.pin()
+        elif bank.backing == FILE_BACKING:
+            bank.drop_pages()
         else:
             bank.pin()
 
@@ -161,7 +254,10 @@ class PinPipeline:
             if self._exc is not None:
                 continue  # drain without pinning after a failure
             try:
-                bank.pin()
+                if bank.backing == FILE_BACKING:
+                    bank.drop_pages()  # spilled layer: after-fill step is an unpin
+                else:
+                    bank.pin()
             except BaseException as exc:  # surfaced by wait()/__exit__
                 self._exc = exc
 

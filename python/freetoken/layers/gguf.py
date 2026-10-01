@@ -22,6 +22,8 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -32,9 +34,9 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_MMQ = _MMVQ
+_DEQUANT = _MMVQ
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
@@ -88,6 +90,31 @@ class GGUFLinear(BaseOP):
         return out
 
 
+class GGUFLMHead(BaseOP):
+    """Untied LM head over a native GGUF block-quantized ``[vocab, row_bytes]`` weight.
+
+    Mirrors gemma4's tied variant: prefill gathers the last position of each request
+    (only those produce logits) before the packed ggml matmul. TP=1 only.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, quant_type: int):
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self._quant_type = quant_type
+        self.qweight = torch.empty(
+            num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.core import get_global_ctx
+
+        batch = get_global_ctx().batch
+        if batch.is_prefill:
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+
+
 class GGUFEmbedding(BaseOP):
     """Vocab embedding stored as a native GGUF block-quantized table.
 
@@ -125,4 +152,4 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+__all__ = ["GGUFLinear", "GGUFEmbedding", "GGUFLMHead", "fused_mul_mat_gguf"]

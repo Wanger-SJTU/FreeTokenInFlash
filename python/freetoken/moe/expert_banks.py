@@ -60,7 +60,7 @@ def _v4_unsupported(quant):
     )
 
 
-def _bf16_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _bf16_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, layer_backing=None, spill_dir=None) -> ExpertBanks:
     from freetoken.models.weight import load_moe_expert_sources
 
     # bf16 banks are written as-loaded -> streamable (dummy fabricates in one shot, so a
@@ -68,7 +68,7 @@ def _bf16_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     sink = None if dummy else layer_sink
     gate_up_source, down_source = load_moe_expert_sources(
         model_path, dtype=dtype, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
-        layer_sink=sink,
+        layer_sink=sink, layer_backing=layer_backing, spill_dir=spill_dir,
     )
     return ExpertBanks(
         "bf16", {"gate_up": gate_up_source, "down": down_source}, streamed=sink is not None
@@ -158,7 +158,7 @@ class _Nvfp4RepackSink:
         return sources, gate_up_alpha, down_alpha
 
 
-def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, layer_backing=None, spill_dir=None) -> ExpertBanks:
     from freetoken.models.weight import load_nvfp4_moe_expert_sources
     from freetoken.moe.nvfp4_backends import (
         b12x_repack_layer,
@@ -195,7 +195,7 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     # parallel only parallelizes the source read; the backend repack below is reused unchanged.
     sources = load_nvfp4_moe_expert_sources(
         model_path, model_config, dummy=dummy, parallel=parallel, workers=workers, chunk=chunk,
-        layer_sink=sink,
+        layer_sink=sink, layer_backing=layer_backing, spill_dir=spill_dir,
     )
     # CPU-compute decode (cpu/hybrid) reads the native ModelOpt rows directly (its
     # dequant-in-GEMV kernel), so keep the native "nvfp4" layout and skip the GPU-tiled
@@ -230,7 +230,7 @@ def _nvfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
     )
 
 
-def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, layer_backing=None, spill_dir=None) -> ExpertBanks:
     if parallel:
         raise NotImplementedError(
             "parallel reader not implemented for q4_0: GGUF is a single packed file "
@@ -244,13 +244,16 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     # per-layer HostBanks (pin-after-fill), so conversion streams each completed layer's
     # gate_up + down straight through the sink (dummy fabricates in one shot -> not streamed).
     sink = None if dummy else layer_sink
-    sources = load_q4_0_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    sources = load_q4_0_moe_expert_sources(
+        model_path, model_config, dummy=dummy, layer_sink=sink,
+        layer_backing=layer_backing, spill_dir=spill_dir,
+    )
     return ExpertBanks(
         "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=sink is not None
     )
 
 
-def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, layer_backing=None, spill_dir=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
     # DeepSeek-FP4: packed e2m1 + e8m0 per-32 block scales, no global scale -> 4 banks,
@@ -265,12 +268,15 @@ def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False,
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources_parallel
 
         banks = load_dsfp4_expert_sources_parallel(
-            model_path, args, workers=workers, chunk=chunk, layer_sink=sink
+            model_path, args, workers=workers, chunk=chunk, layer_sink=sink,
+            layer_backing=layer_backing, spill_dir=spill_dir,
         )
     else:
         from freetoken.models.deepseek_v4.weight import load_dsfp4_expert_sources
 
-        banks = load_dsfp4_expert_sources(model_path, args, layer_sink=sink)
+        banks = load_dsfp4_expert_sources(
+            model_path, args, layer_sink=sink, layer_backing=layer_backing, spill_dir=spill_dir,
+        )
     return ExpertBanks(
         "ds_fp4", {name: banks[name] for name in _BANK_SCHEMAS["ds_fp4"]}, streamed=sink is not None
     )
@@ -293,22 +299,51 @@ def _model_setup_override(model_config):
         return None
 
 
+def _gguf_kq_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None, layer_backing=None, spill_dir=None) -> ExpertBanks:
+    if parallel:
+        raise NotImplementedError(
+            "parallel reader not implemented for gguf_kq: GGUF is a single packed file "
+            "(not safetensors), so the common reader doesn't apply -- it needs a GGUF-native "
+            "parallel reader (parse the tensor table, chunked O_DIRECT over the one file)"
+        )
+    from freetoken.models.weight import load_gguf_kq_moe_expert_sources
+
+    # Native GGUF K-quant routed experts (qwen35moe): packed block bytes streamed to the
+    # GPU and dequantized inside the borrowed ggml MoE kernels. UD straggler layers are
+    # requantized onto the majority type at load so all banks share one shape. Per-layer
+    # HostBanks (pin-after-fill) stream each completed layer's gate_up + down through
+    # the sink (dummy fabricates in one shot -> not streamed).
+    sink = None if dummy else layer_sink
+    sources = load_gguf_kq_moe_expert_sources(
+        model_path, model_config, dummy=dummy, layer_sink=sink,
+        layer_backing=layer_backing, spill_dir=spill_dir,
+    )
+    return ExpertBanks(
+        "gguf_kq", {name: sources[name] for name in _BANK_SCHEMAS["gguf_kq"]},
+        streamed=sink is not None,
+    )
+
+
 # ModelConfig.expert_quant -> provider
 _PROVIDERS = {
     "none": _bf16_banks,
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "gguf_kq": _gguf_kq_banks,
 }
 
 
-def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, layer_backing=None, spill_dir=None) -> ExpertBanks:
     """Dispatch to the model's setup-override or the per-quant provider. ``parallel=True``
     is the parallel read; a provider that hasn't implemented it raises NotImplementedError (the
     caller falls back to serial). ``decode_target`` lets the cpu backend force CPU-readable
     (native, non-GPU-tiled) bank layouts. ``layer_sink`` (converter only) is forwarded to
     setups/providers that declare the parameter; the rest ignore it and stay on the
-    materialize-and-write path (``ExpertBanks.streamed`` reports which happened)."""
+    materialize-and-write path (``ExpertBanks.streamed`` reports which happened).
+    ``layer_backing`` (--cpu-mem only) is the per-layer "pinned"/"pageable" plan: providers
+    that declare the parameter allocate the pageable layers as file-backed spill banks; a
+    setup that cannot honor it fails loudly rather than silently pinning past the budget."""
     setup = _model_setup_override(model_config)
     if setup is not None:
         import inspect
@@ -321,6 +356,12 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
                 f"parallel reader not implemented for {arch} (model owns expert setup "
                 "via setup_offload_expert_banks; add a parallel path there)"
             )
+        if layer_backing is not None and "layer_backing" not in params:
+            arch = getattr(model_config, "architectures", ["?"])[0]
+            raise NotImplementedError(
+                f"--cpu-mem host budget is not implemented for {arch} (model owns expert "
+                "setup via setup_offload_expert_banks; add a layer_backing path there)"
+            )
         kw = dict(device=device, dtype=dtype, dummy=dummy)
         if supports_parallel:
             kw.update(parallel=parallel, workers=workers, chunk=chunk)
@@ -328,6 +369,10 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             kw["decode_target"] = decode_target
         if "layer_sink" in params and layer_sink is not None:
             kw["layer_sink"] = layer_sink
+        if "layer_backing" in params and layer_backing is not None:
+            kw["layer_backing"] = layer_backing
+        if "spill_dir" in params and spill_dir is not None:
+            kw["spill_dir"] = spill_dir
         return setup(model_path, model_config, **kw)
 
     expert_quant = model_config.expert_quant
@@ -339,7 +384,7 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
     return _PROVIDERS[expert_quant](
         model_path, model_config, device, dtype, dummy,
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,
-        layer_sink=layer_sink,
+        layer_sink=layer_sink, layer_backing=layer_backing, spill_dir=spill_dir,
     )
 
 
@@ -383,6 +428,8 @@ def load_expert_banks(
     chunk: int = _PARALLEL_CHUNK,
     decode_target: str = "gpu",
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -400,16 +447,22 @@ def load_expert_banks(
     ``layer_sink`` (the converter only): forwarded to whichever provider is picked; a
     provider only engages it (and reports ``ExpertBanks.streamed=True``) for its own
     streamable formats, so callers must check ``streamed`` rather than assume it fired.
+
+    ``layer_backing`` (--cpu-mem budget): per-layer ``"pinned"``/``"pageable"`` plan from
+    the engine's ``plan_host_residency``. Pageable layers allocate as file-backed spill
+    banks (never pinned; RAM-capped by the page cache) and the returned ``ExpertBanks``
+    carries the plan as ``layer_residency``. ``None`` keeps every layer pinned (default).
     """
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
         banks = load_ftw_banks(
-            model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk
+            model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
+            layer_backing=layer_backing, spill_dir=spill_dir,
         )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
-            return banks
+            return _stamp_layer_residency(banks, layer_backing)
 
     auto = parallel is None
     if auto:
@@ -433,11 +486,22 @@ def load_expert_banks(
     # the process). Only NotImplementedError (quant has no parallel reader; raised before any
     # allocation) falls back to serial.
     try:
-        return _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                   decode_target, layer_sink)
+        banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
+                                    decode_target, layer_sink, layer_backing, spill_dir)
     except NotImplementedError as exc:
         if not parallel:
             raise
         logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
-        return _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                   decode_target, layer_sink)
+        banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
+                                    decode_target, layer_sink, layer_backing, spill_dir)
+    return _stamp_layer_residency(banks, layer_backing)
+
+
+def _stamp_layer_residency(banks: ExpertBanks, layer_backing: list[str] | None) -> ExpertBanks:
+    """Carry the engine's residency plan on the returned bundle (the providers see it for
+    allocation but need not report it back). No-op unless a --cpu-mem plan is active."""
+    if layer_backing is None or banks.layer_residency is not None:
+        return banks
+    from dataclasses import replace
+
+    return replace(banks, layer_residency=list(layer_backing))

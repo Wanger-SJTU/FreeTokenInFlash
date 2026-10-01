@@ -47,6 +47,11 @@ def _PARSE_MEM_BYTES(mem: str) -> int:
     return int(float(mem[:-1]) * UNIT_MAP[mem[-1]])
 
 
+# Public alias: shared with the CLI as the argparse type for --gpu-mem/--cpu-mem
+# ("16G" / "512M" / bare bytes).
+parse_mem_bytes = _PARSE_MEM_BYTES
+
+
 ENV_PREFIX = "FREETOKEN_"
 EnvInt = partial(EnvVar[int], fn=int)
 EnvFloat = partial(EnvVar[float], fn=float)

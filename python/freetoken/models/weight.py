@@ -265,6 +265,8 @@ def load_moe_expert_sources(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> Tuple[list[torch.Tensor], list[torch.Tensor]]:
     config, spec = _spec_for_model_path(model_path)
     if not config.is_moe:
@@ -290,6 +292,8 @@ def load_moe_expert_sources(
         config,
         dtype=dtype,
         layer_sink=layer_sink,
+        layer_backing=layer_backing,
+        spill_dir=spill_dir,
     )
 
 
@@ -302,12 +306,14 @@ def load_nvfp4_moe_expert_sources(
     workers: int = 8,
     chunk: int = 8 << 20,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict:
     """Load (or fabricate, with ``dummy=True``) packed NVFP4 expert source banks.
     ``parallel=True`` uses the model's ``load_nvfp4_expert_sources_parallel`` (common
     chunked multi-threaded O_DIRECT reader). ``layer_sink``: see
     ``models.nvfp4_banks.load_nvfp4_expert_source_banks``; forwarded to the per-model
-    loader, which forwards it on."""
+    loader, which forwards it on. ``layer_backing``: see ``stream_moe_expert_sources``."""
     _config, spec = _spec_for_model_path(model_path)
     if dummy:
         builder = (
@@ -319,9 +325,11 @@ def load_nvfp4_moe_expert_sources(
         if loader is None:  # no parallel reader -> let the caller fall back to serial
             raise NotImplementedError(
                 f"{spec.module} provides no load_nvfp4_expert_sources_parallel")
-        return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink)
+        return loader(model_path, model_config, workers=workers, chunk=chunk, layer_sink=layer_sink,
+                      layer_backing=layer_backing, spill_dir=spill_dir)
     loader = _load_attr(spec.module, "load_nvfp4_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
+    return loader(model_path, model_config, layer_sink=layer_sink,
+                  layer_backing=layer_backing, spill_dir=spill_dir)
 
 
 def load_q4_0_moe_expert_sources(
@@ -330,16 +338,43 @@ def load_q4_0_moe_expert_sources(
     *,
     dummy: bool = False,
     layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
 ) -> dict:
     """Load (or fabricate, with ``dummy=True``) packed GGUF Q4_0 expert source banks.
-    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy."""
+    ``layer_sink`` (converter) streams each completed layer's banks; ignored for dummy.
+    ``layer_backing``: see ``stream_moe_expert_sources``."""
     _config, spec = _spec_for_model_path(model_path)
     if dummy:
         builder = _model_override(spec, "dummy_q4_0_expert_sources")
         assert builder is not None, "model defines no dummy_q4_0_expert_sources"
         return builder(model_config)
     loader = _load_attr(spec.module, "load_q4_0_expert_sources")
-    return loader(model_path, model_config, layer_sink=layer_sink)
+    return loader(model_path, model_config, layer_sink=layer_sink,
+                  layer_backing=layer_backing, spill_dir=spill_dir)
+
+
+def load_gguf_kq_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    dummy: bool = False,
+    layer_sink=None,
+    layer_backing: list[str] | None = None,
+    spill_dir: str | None = None,
+) -> dict:
+    """Load (or fabricate, with ``dummy=True``) packed GGUF K-quant expert source banks
+    (qwen35moe GGUF: typically Q4_K gate_up + Q5_K down). ``layer_sink`` (converter)
+    streams each completed layer's banks; ignored for dummy. ``layer_backing``: see
+    ``stream_moe_expert_sources``."""
+    _config, spec = _spec_for_model_path(model_path)
+    if dummy:
+        builder = _model_override(spec, "dummy_gguf_kq_expert_sources")
+        assert builder is not None, "model defines no dummy_gguf_kq_expert_sources"
+        return builder(model_config)
+    loader = _load_attr(spec.module, "load_gguf_kq_expert_sources")
+    return loader(model_path, model_config, layer_sink=layer_sink,
+                  layer_backing=layer_backing, spill_dir=spill_dir)
 
 
 def _num_moe_layers(config) -> int:
@@ -407,6 +442,8 @@ __all__ = [
     "load_weight",
     "load_moe_expert_sources",
     "load_nvfp4_moe_expert_sources",
+    "load_q4_0_moe_expert_sources",
+    "load_gguf_kq_moe_expert_sources",
     "dummy_moe_expert_sources",
     "dummy_nvfp4_expert_sources",
     "iter_expert_tensors_parallel",

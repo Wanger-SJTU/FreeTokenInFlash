@@ -52,6 +52,9 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
+| `--gpu-mem` | unset | Absolute GPU memory budget (e.g. `16G`): weights + MoE slots + KV pools together must fit under it (pools auto-shrink, MoE first). Mutually exclusive with `--memory-ratio`; CUDA graphs/activations sit on top |
+| `--cpu-mem` | unset | Host RAM budget bounding the **pinned** expert banks: MoE layers are pinned in id order until it is used up, the rest load as file-backed spill banks (RAM-capped by the page cache) and decode on the CPU executor. Offload backends only |
+| `--cpu-mem-spill-dir` | model directory | Where `--cpu-mem` spill files live (unlinked immediately; disk freed at exit) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |
 | `--cache-type` | radix | `radix` (prefix reuse; SWA/GDN-aware variants picked automatically) or `naive` |

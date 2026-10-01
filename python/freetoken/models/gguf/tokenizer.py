@@ -13,7 +13,7 @@ from typing import Any
 from .reader import gguf_architecture, load_gguf_metadata
 
 # GGUF architecture -> transformers GGUF tokenizer-converter key.
-_TOKENIZER_ARCH = {"gemma4": "gemma4_text"}
+_TOKENIZER_ARCH = {"gemma4": "gemma4_text", "qwen35moe": "gpt2"}
 
 
 def load_gguf_tokenizer(model_path: str):
@@ -64,7 +64,7 @@ def gguf_eos_token_ids(model_path: str, tokenizer) -> set[int]:
         ids.add(int(eid))
     # Look the stop tokens up in the vocab directly (convert_tokens_to_ids would map an
     # absent name to <unk>, wrongly adding it as a stop id).
-    for name in ("<eos>", "<turn|>"):
+    for name in ("<eos>", "<turn|>", "<|im_end|>"):
         try:
             ids.add(tokens.index(name))
         except ValueError:

@@ -389,7 +389,8 @@ def _q4_0_expert_specs(config: ModelConfig) -> dict[str, tuple[tuple[int, ...], 
 
 
 def load_q4_0_expert_sources(
-    model_path: str, config: ModelConfig, *, layer_sink=None
+    model_path: str, config: ModelConfig, *, layer_sink=None,
+    layer_backing: list[str] | None = None, spill_dir: str | None = None,
 ) -> dict[str, list[torch.Tensor]]:
     """Per-layer host banks of the routed experts' native Q4_0 block bytes.
 
@@ -413,7 +414,9 @@ def load_q4_0_expert_sources(
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
     h_bytes, i_bytes = row_bytes(H, GGML_Q4_0), row_bytes(I, GGML_Q4_0)
-    hb = alloc_layer_banks(_q4_0_expert_specs(config), L)  # lazy anon mmaps (unpinned)
+    # --cpu-mem: pageable layers allocate file-backed spill banks (never pinned).
+    backing = "anon" if layer_backing is None else layer_backing
+    hb = alloc_layer_banks(_q4_0_expert_specs(config), L, backing=backing, spill_dir=spill_dir)
     banks = {name: [b.tensor for b in hb[name]] for name in hb}
     seen_gu, seen_dn = set(), set()
 
