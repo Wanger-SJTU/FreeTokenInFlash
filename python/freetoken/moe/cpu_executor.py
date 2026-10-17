@@ -68,7 +68,7 @@ _ACT_IDS = {
 }
 
 # Weight-format ids must match WFmt in csrc/cpu_moe/cpu_moe_ext.cpp.
-_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4}
+_WFMT_IDS = {"bf16": 0, "nvfp4": 1, "mxfp4_triton": 2, "ds_fp4": 3, "q4_0": 4, "gguf_kq": 5}
 
 
 def compiled_extension_supports(activation: str) -> bool:
@@ -367,6 +367,9 @@ class CpuMoeExecutor:
         if fmt == "q4_0":
             return self._resolve_q4_0_banks(banks)
 
+        if fmt == "gguf_kq":
+            return self._resolve_gguf_kq_banks(banks)
+
         if fmt == "mxfp4_triton":
             return self._resolve_mxfp4_banks(banks)
 
@@ -423,6 +426,48 @@ class CpuMoeExecutor:
             down_global_ptr=0,
             gate_up_bias_ptr=0,
             down_bias_ptr=0,
+        )
+        return ptrs, (H, I)
+
+    def _resolve_gguf_kq_banks(self, banks: dict) -> tuple[dict, tuple[int, int]]:
+        """Native qwen35moe GGUF K-quant schema: gate_up ``[S, 2I, H//256*sb]`` and down
+        ``[S, H, I//256*sb]`` packed uint8 rows, where ``sb`` is 144 (Q4_K) or 176 (Q5_K)
+        per 256-elem super-block -- possibly different quants per pass (the dominant UD
+        mix is Q4_K gate_up + Q5_K down). The per-pass row byte counts ride the C++ ctor
+        (``gu_row_bytes``/``dn_row_bytes``), which picks each pass's dequant dot from
+        them; the W4A8 activation staging is the shared q4_0 machinery (the Q8_0 block
+        granularity coincides with the K-quant 32-elem sub-block)."""
+        gate_up, down = banks["gate_up"], banks["down"]
+        assert gate_up[0].dtype == torch.uint8 and down[0].dtype == torch.uint8, (
+            gate_up[0].dtype, down[0].dtype,
+        )
+        I = int(gate_up[0].shape[1] // 2)
+        H = int(down[0].shape[1])
+        assert gate_up[0].shape[1] == 2 * I
+        assert H % 256 == 0 and I % 256 == 0, (H, I)
+
+        def _check(rows: torch.Tensor, K: int, what: str) -> int:
+            rb = int(rows.shape[2])
+            per256, rem = divmod(rb * 256, K)
+            assert rem == 0 and per256 in (144, 176), (
+                f"{what}: {rb} row bytes over K={K} is {per256}+{rem}/256 B/256; "
+                "CPU MoE implements Q4_K (144) and Q5_K (176)"
+            )
+            return rb
+
+        gu_rb = _check(gate_up[0], H, "gate_up")
+        dn_rb = _check(down[0], I, "down")
+        ptrs = dict(
+            gate_up_ptr=self._make_table(gate_up).data_ptr(),
+            down_ptr=self._make_table(down).data_ptr(),
+            gate_up_scale_ptr=0,
+            gate_up_global_ptr=0,
+            down_scale_ptr=0,
+            down_global_ptr=0,
+            gate_up_bias_ptr=0,
+            down_bias_ptr=0,
+            gu_row_bytes=gu_rb,
+            dn_row_bytes=dn_rb,
         )
         return ptrs, (H, I)
 
