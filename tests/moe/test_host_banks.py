@@ -90,3 +90,81 @@ def test_pin_pipeline_drops_file_backed_banks_without_blocking():
         pins(0, {"gate_up": bank})
     assert bank._pinned is False
     assert torch.equal(bank.tensor, expected)
+
+
+# --------------------------------------------------------------------------------------
+# --cpu-mem-mode expert: the split (anonymous prefix + file suffix) bank layout.
+# --------------------------------------------------------------------------------------
+
+
+def test_parse_layer_backing_values():
+    from freetoken.moe.host_banks import parse_layer_backing
+
+    assert parse_layer_backing("pinned") == ("anon", None)
+    assert parse_layer_backing("pageable") == ("file", None)
+    assert parse_layer_backing("split") == ("split", None)
+    assert parse_layer_backing("split:37") == ("split", 37)
+    # raw backing constants pass through untouched
+    assert parse_layer_backing("anon") == ("anon", None)
+    assert parse_layer_backing("file") == ("file", None)
+
+
+@pytest.mark.skipif(not _LINUX, reason="split banks are Linux-only (MAP_FIXED)")
+def test_host_bank_split_survives_pin_and_drop():
+    """The expert-mode promise: the tensor is ONE contiguous [E, ...] buffer straddling
+    two mappings; pin() registers only the anonymous prefix, drop_pages() returns only
+    the file-backed suffix -- and all the data survives both."""
+    from freetoken.moe.host_banks import SPLIT_BACKING, HostResidency
+
+    E, R, RB = 16, 4, 128
+    bank = HostBank((E, R, RB), torch.uint8, backing=SPLIT_BACKING, split_experts=6)
+    assert bank.backing == SPLIT_BACKING
+    assert bank.split_experts == 6
+    assert bank.residency == HostResidency.SPLIT
+    assert 0 < bank.anon_bytes < bank.nbytes  # genuinely straddles
+
+    expected = torch.arange(E * R * RB, dtype=torch.uint8).reshape(E, R, RB)
+    bank.tensor.copy_(expected)
+    assert torch.equal(bank.tensor, expected)  # contiguous across both mappings
+
+    if torch.cuda.is_available():
+        bank.pin()  # registers ONLY [addr, addr + anon_bytes)
+    bank.drop_pages()  # drops ONLY the file suffix
+    assert torch.equal(bank.tensor[:6], expected[:6])  # prefix resident, verbatim
+    assert torch.equal(bank.tensor, expected)  # suffix re-faulted from the spill file
+
+
+@pytest.mark.skipif(not _LINUX, reason="split banks are Linux-only (MAP_FIXED)")
+def test_alloc_layer_banks_parses_split_plan_entries():
+    """"split:<k>" plan values (the --cpu-mem expert plan rides layer_backing) allocate
+    split banks with the parsed k; mixed plans stay per-layer."""
+    from freetoken.moe.host_banks import ANON_BACKING, FILE_BACKING, SPLIT_BACKING
+
+    specs = {"gate_up": ((8, 16), torch.float32)}
+    hb = alloc_layer_banks(specs, 3, backing=["split:4", "pinned", "pageable"])
+    gate_up = hb["gate_up"]
+    assert gate_up[0].backing == SPLIT_BACKING and gate_up[0].split_experts == 4
+    assert gate_up[1].backing == ANON_BACKING
+    assert gate_up[2].backing == FILE_BACKING
+
+    with pytest.raises(AssertionError, match="split"):
+        # a bare "split" entry needs the count from somewhere
+        alloc_layer_banks(specs, 1, backing=["split"])
+
+
+@pytest.mark.skipif(not _LINUX, reason="split banks are Linux-only (MAP_FIXED)")
+def test_pin_banks_finishes_split_prefix_and_suffix():
+    """pin_banks (the loaders' after-fill step) pins the split prefix AND drops the
+    suffix, in one pass."""
+    from freetoken.moe.host_banks import SPLIT_BACKING
+
+    specs = {"gate_up": ((8, 16), torch.float32)}
+    hb = alloc_layer_banks(specs, 1, backing=["split:4"])
+    bank = hb["gate_up"][0]
+    bank.tensor.copy_(torch.randn(8, 16))
+    expected = bank.tensor.clone()
+    pin_banks(hb)
+    assert bank.backing == SPLIT_BACKING
+    assert torch.equal(bank.tensor, expected)
+    if torch.cuda.is_available():
+        assert bank._pinned
