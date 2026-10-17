@@ -106,3 +106,52 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_hybrid_host_pool_routes_unpinned_misses_to_cpu():
+    """--cpu-mem-mode expert: the global host pool narrows fetch candidates to experts
+    holding a pool slot. With an unbounded cap every pinned miss is fetched (its copy
+    row is the POOL slot id); unpinned misses rewrite to -1 (CPU executor) even though
+    GPU slots are free. GPU kernel == CPU reference."""
+    L, E, N = 2, 32, 8  # N slots warm round-robin: experts 0..3 pinned on both layers
+
+    def make():
+        cache = OffloadMoeCache(
+            num_layers=L, num_experts=E, cache_size=64,
+            device=torch.device("cuda"), quant_format="bf16", decode_target="hybrid",
+            hybrid_max_fetch=E,
+        )
+        cache.set_bank_sources(
+            {"gate_up": [torch.randn(E, 32, 8, device="cuda") for _ in range(L)],
+             "down": [torch.randn(E, 8, 16, device="cuda") for _ in range(L)]},
+        )
+        cache.set_host_expert_pool(N)
+        return cache
+
+    gpu, ref = make(), make()
+    assert gpu.host_pool_size == N
+    assert gpu.host_slot_for_id.shape == (L, E)
+    assert bool((gpu.host_slot_for_id[:, : N // L] >= 0).all())
+    assert bool((gpu.host_slot_for_id[:, N // L :] == -1).all())
+
+    torch.manual_seed(7)
+    pinned_bound = N // L
+    for _step in range(32):
+        ids = torch.randperm(E)[:8].to(torch.int32)
+        resident = {e for e in ids.tolist() if e < pinned_bound}
+        in_slots = {e for e, s in enumerate(gpu.slot_for_id[0].tolist()) if s >= 0}
+        g, c = ids.clone().cuda(), ids.clone()
+        gpu.ensure_experts_hybrid(0, g)
+        ref.ensure_experts_hybrid(0, c)
+        # unpinned experts are never fetched: their routes rewrite to -1
+        for i, e in enumerate(ids.tolist()):
+            if e >= pinned_bound:
+                assert g[i].item() == -1
+        # the miss/fetch counts cover only pool-resident misses
+        assert int(gpu.num_missing_full.item()) == len(resident - in_slots)
+        assert int(gpu.num_indices.item()) == int(gpu.num_missing_full.item())
+        # state parity with the reference mirror
+        assert int(ref.num_missing_full.item()) == int(gpu.num_missing_full.item())
+        assert torch.equal(g.cpu(), c)
+        assert torch.equal(gpu.slot_for_id.cpu(), ref.slot_for_id.cpu())

@@ -575,6 +575,14 @@ def _dummy_sources(quant: str, nvfp4_native: bool):
             "gate_up": bank((_E, 2 * _I, _H // 32 * 18)),
             "down": bank((_E, _H, _I // 32 * 18)),
         }
+    if quant == "gguf_kq":
+        from freetoken.models.gguf.dequant import GGML_Q4_K, GGML_Q5_K, row_bytes
+
+        rb = lambda n, ty: row_bytes(((n + 255) // 256) * 256, ty)  # noqa: E731
+        return {
+            "gate_up": bank((_E, 2 * _I, rb(_H, GGML_Q4_K))),
+            "down": bank((_E, _H, rb(_I, GGML_Q5_K))),
+        }
     if quant == "nvfp4":
         if nvfp4_native:
             return {
@@ -614,6 +622,7 @@ def _dummy_sources(quant: str, nvfp4_native: bool):
     ("none", False),
     ("fp8_block", False),
     ("q4_0", False),
+    ("gguf_kq", False),
     ("nvfp4", True),
     ("nvfp4", False),
     ("mxfp4_triton", False),
@@ -725,3 +734,22 @@ def test_validate_rebuild_fit_check_honors_gpu_budget():
             num_pages=target_pages, target_moe=0, per_expert_bytes=0,
             baseline_free=10**9, weights_bytes=0, current_num_pages=1,
         )
+
+
+def test_plan_host_pool_slots_budget_buys_shared_slots():
+    """--cpu-mem-mode expert: the budget buys N pinned expert slots in ONE global pool
+    shared across all layers (not per-layer); None/unknown geometry pins everything
+    (mirrors the layer plan's no-silent-spill rule)."""
+    from freetoken.engine.cache_budget import plan_host_pool_slots
+
+    L, E, per_expert = 40, 256, 1800
+    layer_bytes = E * per_expert
+    total = L * E
+    assert plan_host_pool_slots(L, layer_bytes, E, 5000 * per_expert) == 5000
+    assert plan_host_pool_slots(L, layer_bytes, E, 10 * L * per_expert + 3 * L) == 10 * L
+    # clamped at both ends
+    assert plan_host_pool_slots(L, layer_bytes, E, 10 * total * per_expert) == total
+    assert plan_host_pool_slots(L, layer_bytes, E, per_expert - 1) == 0
+    # None budget / unknown geometry -> fully pinned
+    assert plan_host_pool_slots(L, layer_bytes, E, None) == total
+    assert plan_host_pool_slots(L, 0, E, 1 << 40) == total

@@ -175,9 +175,10 @@ def cache_status_rows(geometry: dict) -> List[Tuple[str, str, int, str]]:
 
 
 def format_host_lines(geometry: dict) -> List[str]:
-    """The host tier of the expert cache (--gpu-mem/--cpu-mem budgets + the pinned/spilled
-    layer split), as extra lines under the pool table. Empty when the server reported no
-    host section (older engine, or no budget in play -- the report stays as it was)."""
+    """The host tier of the expert cache (--gpu-mem/--cpu-mem budgets + the pinned/spilled/
+    split layer residency), as extra lines under the pool table. Empty when the server
+    reported no host section (older engine, or no budget in play -- the report stays as
+    it was)."""
     host = (geometry or {}).get("host")
     if not isinstance(host, dict):
         return []
@@ -185,19 +186,26 @@ def format_host_lines(geometry: dict) -> List[str]:
     cpu_budget = _int(host, "cpu_budget_bytes")
     pinned = _int(host, "pinned_layers")
     spilled = _int(host, "spilled_layers")
-    if gpu_budget <= 0 and cpu_budget <= 0 and spilled <= 0:
+    pool_slots = _int(host, "host_pool_slots")
+    if gpu_budget <= 0 and cpu_budget <= 0 and spilled <= 0 and pool_slots <= 0:
         return []
+    mode = host.get("cpu_mem_mode") or "expert"
     lines = []
     if gpu_budget > 0:
         lines.append(f"  host: gpu budget {format_bytes(gpu_budget)} (weights + pools)")
-    if cpu_budget > 0 or spilled > 0:
-        parts = [f"expert banks pinned {pinned} layers"]
-        if spilled > 0:
+    if cpu_budget > 0 or spilled > 0 or pool_slots > 0:
+        if pool_slots > 0:
+            parts = [
+                f"expert host pool {pool_slots} slots (global across layers, LRU)"
+            ]
+        else:
+            parts = [f"expert banks pinned {pinned} layers"]
+        if spilled > 0 and pool_slots <= 0:
             parts.append(
                 f"spilled {spilled} layers (page-cache backed, CPU-executor decode)"
             )
         if cpu_budget > 0:
-            parts.append(f"budget {format_bytes(cpu_budget)}")
+            parts.append(f"budget {format_bytes(cpu_budget)} ({mode})")
         lines.append("  host: " + ", ".join(parts))
     return lines
 

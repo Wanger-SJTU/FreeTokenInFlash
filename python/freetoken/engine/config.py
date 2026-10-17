@@ -63,11 +63,15 @@ class EngineConfig:
     # memory_ratio. CUDA graphs / activations sit on top of this budget (a post-init
     # check warns if actual usage exceeds it). Works for dense models too (KV sizing).
     gpu_mem_budget: int | None = None
-    # Host RAM budget (--cpu-mem, bytes): bounds the PINNED expert-bank memory. Layers
-    # that fit keep today's all-pinned behavior; the rest load as file-backed spill
-    # banks (page-cache-paged, never pinned) and decode on the CPU executor. None =
-    # every layer pinned (default). Startup-time only (no runtime re-planning).
+    # Host RAM budget (--cpu-mem, bytes): bounds the PINNED expert-bank memory.
+    # cpu_mem_mode decides the split: "expert" (default) spreads the budget evenly
+    # across layers, each pinning its first k experts (the rest of every layer is a
+    # file-backed, page-cache-paged suffix read by the CPU executor); "layer" pins
+    # whole layers in id order until the budget is used up, the rest decoding on the
+    # CPU executor. None = every layer fully pinned (default). Startup-time only.
     cpu_mem_budget: int | None = None
+    # --cpu-mem-mode {expert,layer}: how the --cpu-mem budget divides the host banks.
+    cpu_mem_mode: str = "expert"
     # Where --cpu-mem spill files live (default: the model directory; they are unlinked
     # immediately and their disk space is freed at process exit).
     cpu_mem_spill_dir: str | None = None

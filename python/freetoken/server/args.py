@@ -286,9 +286,24 @@ def parse_args(
         default=ServerArgs.cpu_mem_budget,
         help=(
             "Host RAM budget (e.g. 32G) bounding the PINNED expert banks (offload "
-            "backends). MoE layers are pinned in id order until the budget is used up; "
-            "the rest load as file-backed spill banks (RAM-capped by the OS page cache) "
-            "and decode on the CPU executor. Unset = pin every layer (default)."
+            "backends). With --cpu-mem-mode expert (default) the budget is spread "
+            "evenly: every layer pins its first k experts, the rest of each layer is a "
+            "file-backed suffix (RAM-capped by the OS page cache) decoded on the CPU. "
+            "With mode layer, whole layers pin in id order until the budget is used up "
+            "and the rest decode on the CPU executor. Unset = pin everything (default)."
+        ),
+    )
+
+    parser.add_argument(
+        "--cpu-mem-mode",
+        dest="cpu_mem_mode",
+        type=str,
+        choices=("expert", "layer"),
+        default=ServerArgs.cpu_mem_mode,
+        help=(
+            "How --cpu-mem divides the host banks: 'expert' (default) splits the "
+            "budget evenly across layers, pinning each layer's first k experts; "
+            "'layer' pins whole layers in id order (the pre-0.2 behavior)."
         ),
     )
 

@@ -53,7 +53,8 @@ parsers all resolve automatically from the checkpoint and the GPU.
 |---|---|---|
 | `--memory-ratio` | 0.9 | Fraction of free VRAM the engine may use (weights + MoE cache + KV) |
 | `--gpu-mem` | unset | Absolute GPU memory budget (e.g. `16G`): weights + MoE slots + KV pools together must fit under it (pools auto-shrink, MoE first). Mutually exclusive with `--memory-ratio`; CUDA graphs/activations sit on top |
-| `--cpu-mem` | unset | Host RAM budget bounding the **pinned** expert banks: MoE layers are pinned in id order until it is used up, the rest load as file-backed spill banks (RAM-capped by the page cache) and decode on the CPU executor. Offload backends only |
+| `--cpu-mem` | unset | Host RAM budget for the **pinned** expert memory. Offload backends only. How it divides depends on `--cpu-mem-mode` |
+| `--cpu-mem-mode` | expert | `expert`: the budget buys N pinned expert slots in ONE global pool shared across all layers (the host-side mirror of the GPU slot cache); banks load file-backed (RAM-capped by the page cache), pool-resident misses stream over PCIe, the rest decode on the CPU executor, and a runtime LRU re-plans the pool per decode step. `layer`: pin whole MoE layers in id order until the budget is used up, the rest decode on the CPU executor |
 | `--cpu-mem-spill-dir` | model directory | Where `--cpu-mem` spill files live (unlinked immediately; disk freed at exit) |
 | `--num-pages` / `--num-tokens` | auto | KV capacity override in pages / tokens (mutually exclusive; auto sizes from VRAM left after weights and MoE cache) |
 | `--page-size` | 1 | KV page size; DSV4 forces 128, the TRTLLM backend needs 16/32/64, SWA models require 1 |

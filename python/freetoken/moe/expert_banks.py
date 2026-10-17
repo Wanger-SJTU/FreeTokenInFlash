@@ -499,9 +499,14 @@ def load_expert_banks(
 
 def _stamp_layer_residency(banks: ExpertBanks, layer_backing: list[str] | None) -> ExpertBanks:
     """Carry the engine's residency plan on the returned bundle (the providers see it for
-    allocation but need not report it back). No-op unless a --cpu-mem plan is active."""
+    allocation but need not report it back). No-op unless a --cpu-mem plan is active.
+    ``"split:<k>"`` plan values are normalized to ``"split"`` (the split HostBank
+    primitive's encoding; the count rides with the plan string)."""
     if layer_backing is None or banks.layer_residency is not None:
         return banks
     from dataclasses import replace
 
-    return replace(banks, layer_residency=list(layer_backing))
+    return replace(
+        banks,
+        layer_residency=[b.split(":", 1)[0] if b.startswith("split") else b for b in layer_backing],
+    )

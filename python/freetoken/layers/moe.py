@@ -355,7 +355,9 @@ class OffloadMoELayer(MoELayer):
             executor.decode_sync(pending) if not _HYBRID_OVERLAP else None
         )
 
-        cache.copy_missing()
+        # masked=True: on split (--cpu-mem-mode expert) layers the residency-masked
+        # ensure above guarantees every staged row is in the registered prefix.
+        cache.copy_missing(masked=True)
         gpu_slots = topk_ids.clamp_min(0)  # -1 -> slot 0 (zero-weighted below)
         gpu_w = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(())).contiguous()
         gpu_routed = self._expert_gemm(

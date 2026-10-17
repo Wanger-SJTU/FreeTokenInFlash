@@ -175,8 +175,9 @@ class FrontendManager:
     # (the running snapshot channel) has anything. None until meta arrives.
     cache_pools: Dict[str, int] | None = None
     # Host-side expert-bank residency + memory budgets (--gpu-mem / --cpu-mem): {"gpu_budget_bytes",
-    # "cpu_budget_bytes", "pinned_layers", "spilled_layers", "spill_dir"}, from the same ack.
-    # None until meta arrives (older engine); geometry omits the host section then.
+    # "cpu_budget_bytes", "cpu_mem_mode", "pinned_layers", "spilled_layers", "host_pool_slots",
+    # "spill_dir"}, from the same ack. None until meta arrives (older engine); geometry
+    # omits the host section then.
     host_meta: Dict[str, Any] | None = None
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
     # BackendHandle after start_backend(). The orderly-shutdown path (lifespan / shell signal

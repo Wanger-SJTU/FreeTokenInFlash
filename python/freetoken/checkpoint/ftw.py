@@ -477,9 +477,22 @@ def load_ftw_banks(
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
     layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
 
+    def _split_k_for(layer_id: int) -> int | None:
+        if layer_backing is None:
+            return None
+        from freetoken.moe.host_banks import parse_layer_backing
+
+        backing, k = parse_layer_backing(layer_backing[layer_id])
+        return k if backing == "split" else None
+
     def _bank_for_layer(shape, layer_id: int, *, dtype=torch.uint8) -> HostBank:
         # --cpu-mem plan: pageable layers get file-backed spill banks (never pinned; the
-        # PinPipeline drops their pages after fill and accesses re-fault from disk).
+        # PinPipeline drops their pages after fill and accesses re-fault from disk);
+        # "split:<k>" layers get the straddling layout (registered anonymous prefix of k
+        # experts + file-backed suffix).
+        k = _split_k_for(layer_id)
+        if k is not None:
+            return HostBank(shape, dtype, backing="split", split_experts=k, spill_dir=spill_dir)
         if layer_backing is not None and layer_backing[layer_id] != "pinned":
             return HostBank(shape, dtype, backing="file", spill_dir=spill_dir)
         return HostBank(shape, dtype)
@@ -497,6 +510,22 @@ def load_ftw_banks(
         row_view_args[name] = []
         for layer_id in range(num_layers):
             off = e["global_off"] + layer_id * layer_bytes
+            if _split_k_for(layer_id) is not None:
+                # Split banks allocate the LOGICAL [num_experts, *row_shape] tensor, so
+                # the read must be exactly the layer's byte range: the padded-window
+                # carve cannot express a mid-buffer prefix/suffix boundary.
+                if off % ALIGN != 0 or layer_bytes % ALIGN != 0:
+                    raise NotImplementedError(
+                        f"--cpu-mem-mode expert over FTW flat-layout bank {name!r} needs "
+                        f"ALIGN-aligned layer offsets (off={off % ALIGN}, "
+                        f"layer_bytes%ALIGN={layer_bytes % ALIGN}); use --cpu-mem-mode layer "
+                        "or re-convert the checkpoint (per-layer bank entries)"
+                    )
+                bank = _bank_for_layer((num_experts, *row_shape), layer_id, dtype=dtype)
+                row_hb[name].append(bank)
+                row_view_args[name].append(None)  # already the logical tensor
+                row_jobs.append((name, bank, off, layer_bytes, layer_bytes))
+                continue
             win_off = (off // ALIGN) * ALIGN
             win_end = _align_up(off + layer_bytes)
             head_pad = off - win_off

@@ -1,5 +1,7 @@
 from contextlib import contextmanager
 
+import platform
+
 import pytest
 import torch
 
@@ -732,3 +734,117 @@ def test_copy_missing_serves_spilled_layer_through_torch_fallback():
     assert torch.equal(cache.bank_caches["gate_up"][1], gate_up[2])
     assert torch.equal(cache.bank_caches["down"][0], down[3])
     assert torch.equal(cache.bank_caches["down"][1], down[2])
+
+
+def test_set_host_expert_pool_builds_global_shared_pool():
+    # --cpu-mem-mode expert: one pool shared across ALL layers; the warm fill is
+    # round-robin (expert-major), the mapping table lives host+device, and unpinned
+    # experts read -1. Split-residency values stay accepted (HostBank primitive).
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    L, E, N = 2, 4, 3
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=6, device=torch.device("cpu"))
+    cache.set_bank_sources(
+        {"gate_up": [torch.randn(E, 32, 8)] * L, "down": [torch.randn(E, 8, 16)] * L},
+        layer_residency=["pageable"] * L,
+    )
+    cache.set_host_expert_pool(N)
+    assert cache.host_pool_size == N
+    assert cache.host_slot_for_id.shape == (L, E)
+    # round-robin: expert 0 of every layer, then expert 1 of layer 0
+    assert int(cache.host_slot_for_id[0, 0]) == 0
+    assert int(cache.host_slot_for_id[1, 0]) == 1
+    assert int(cache.host_slot_for_id[0, 1]) == 2
+    assert int(cache.host_slot_for_id[1, 1]) == -1
+    for name in ("gate_up", "down"):
+        assert cache.host_pool[name].shape[0] == N
+    # warm rows must equal the bank bytes they were filled from
+    assert torch.equal(cache.host_pool["gate_up"][0], cache.bank_sources["gate_up"][0][0])
+    assert torch.equal(cache.host_pool["gate_up"][2], cache.bank_sources["gate_up"][0][1])
+
+
+def test_copy_missing_unmasked_ignores_the_host_pool():
+    # Prefill (unmasked) materialization of a pooled layer must stage through torch
+    # indexing: the fused gather would dereference non-pooled rows.
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
+    gate_up = torch.randn(4, 32, 8)
+    down = torch.randn(4, 8, 16)
+    cache.set_bank_sources({"gate_up": [gate_up], "down": [down]}, layer_residency=["pageable"])
+    cache.set_host_expert_pool(2)
+
+    cache._pending_src_layer = 0
+    cache.evict_slots[0] = 0
+    cache.src_indices[0] = 3  # an unpooled row: only the torch path may serve it
+    cache.num_indices[0] = 1
+    cache.copy_missing()  # unmasked -> pageable fallback, the pool stays out of it
+    assert torch.equal(cache.bank_caches["gate_up"][0], gate_up[3])
+    assert torch.equal(cache.bank_caches["down"][0], down[3])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_masked_copy_gathers_pooled_rows_into_the_slot_cache():
+    """End-to-end pooled decode fetch: the pool-aware hybrid ensure schedules only
+    pool-resident misses (copy rows = pool slot ids); copy_missing(masked=True)
+    fused-gathers them off the registered pool tensors and the slot cache rows match
+    the source bank bytes."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    E, N = 16, 6
+    dev = torch.device("cuda")
+    gate_up = torch.randint(0, 256, (E, 4, 128), dtype=torch.uint8)
+    down = torch.zeros(E, 4, 128, dtype=torch.uint8)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=E, cache_size=E, device=dev,
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=E,
+    )
+    cache.set_bank_sources({"gate_up": [gate_up], "down": [down]}, layer_residency=["pageable"])
+    cache.set_host_expert_pool(N)  # warm: experts 0..5 of layer 0
+    assert cache._pool_src_ptrs is not None
+
+    ids = torch.tensor([3, 10, 5, 14, 0], dtype=torch.int32, device=dev)  # mix pooled/unpooled
+    cache.ensure_experts_hybrid(0, ids)
+    rewritten = ids.tolist()
+    assert rewritten[0] >= 0 and rewritten[2] >= 0 and rewritten[4] >= 0  # pooled: fetched
+    assert rewritten[1] == -1 and rewritten[3] == -1  # unpooled -> CPU executor
+    cache.copy_missing(masked=True)
+    torch.cuda.synchronize()
+    for i, e in enumerate([3, 10, 5, 14, 0]):
+        slot = rewritten[i]
+        if slot >= 0:
+            assert torch.equal(cache.bank_caches["gate_up"][slot].cpu(), gate_up[e])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_maintain_host_pool_promotes_hot_and_demotes_cold():
+    """The between-steps re-plan: the hottest unpinned expert (by expert_recency, i.e.
+    one the CPU just computed) is promoted into the coldest pool slot; the demoted
+    mapping reads -1 and the pool bytes match the promoted expert."""
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    E, N = 8, 2
+    dev = torch.device("cuda")
+    gate_up = torch.randint(0, 256, (E, 4, 128), dtype=torch.uint8)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=E, cache_size=E, device=dev,
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=E,
+    )
+    cache.set_bank_sources(
+        {"gate_up": [gate_up], "down": [torch.zeros(E, 4, 128, dtype=torch.uint8)]},
+        layer_residency=["pageable"],
+    )
+    cache.set_host_expert_pool(N)  # warm: experts 0..1
+
+    # expert 7 was just active (CPU-computed), experts 0/1 idle -> victim = coldest
+    cache.expert_recency[0, 7] = 100
+    cache.host_usage[0] = 5  # slot 0 recently used; slot 1 (usage 0) is the coldest
+    promoted = cache.maintain_host_pool(promote_per_call=1)
+    assert promoted == 1
+    assert int(cache.host_slot_for_id[0, 7]) == 1  # promoted into the coldest slot
+    assert int(cache.host_slot_for_id[0, 1]) == -1  # demoted, no writeback needed
+    assert torch.equal(cache.host_pool["gate_up"][1], gate_up[7])

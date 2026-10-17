@@ -225,11 +225,15 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     try:
         moe = engine.moe_offload_cache
         residency = list(getattr(moe, "layer_residency", None) or [])
+        pool_size = int(getattr(moe, "host_pool_size", 0) or 0)
         meta["host"] = {
             "gpu_budget_bytes": int(getattr(cfg, "gpu_mem_budget", None) or 0),
             "cpu_budget_bytes": int(getattr(cfg, "cpu_mem_budget", None) or 0),
+            "cpu_mem_mode": str(getattr(cfg, "cpu_mem_mode", "expert")),
             "pinned_layers": sum(1 for r in residency if r == "pinned"),
-            "spilled_layers": sum(1 for r in residency if r != "pinned"),
+            "spilled_layers": sum(1 for r in residency if r == "pageable"),
+            # expert mode: the global pinned host pool (slots shared across layers)
+            "host_pool_slots": pool_size,
             "spill_dir": str(
                 getattr(cfg, "cpu_mem_spill_dir", None) or getattr(cfg, "model_path", "") or ""
             ),

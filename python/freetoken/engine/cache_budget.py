@@ -137,6 +137,25 @@ def plan_host_residency(
     return plan
 
 
+def plan_host_pool_slots(
+    num_layers: int, layer_bytes: int, num_experts: int, budget_bytes: int | None
+) -> int:
+    """Global host-pool slot count for --cpu-mem-mode expert: the budget buys N
+    pinned expert slots shared across ALL layers (one global pool, mirroring the
+    unified GPU slot cache), clamped to ``[0, num_layers * num_experts]``.
+
+    ``budget_bytes`` None pins everything (``N == L * E``); ``layer_bytes <= 0``
+    (unknown geometry) also pins everything, mirroring :func:`plan_host_residency`:
+    an unmeasurable budget must not silently spill."""
+    total = num_layers * num_experts
+    if budget_bytes is None or layer_bytes <= 0:
+        return total
+    per_expert = layer_bytes // num_experts
+    if per_expert <= 0:
+        return 0
+    return max(0, min(int(budget_bytes) // per_expert, total))
+
+
 def estimate_layer_bank_bytes(
     *,
     hidden_size: int,
@@ -179,6 +198,17 @@ def estimate_layer_bank_bytes(
     elif expert_quant == "q4_0":
         # packed 4-bit blocks: 18 bytes per 32 elements, per output row
         per_expert = 2 * I * (H // 32 * 18) + H * (I // 32 * 18)
+    elif expert_quant == "gguf_kq":
+        # Native GGUF K-quant banks: Q4_K gate_up + Q5_K down (the dominant real
+        # layout; UD stragglers requant onto Q5_K at load, and other mixes shift
+        # the estimate by well under a slot-count rounding step). K-quant rows
+        # occupy whole super-blocks, so round dims up to the 256-element block.
+        from freetoken.models.gguf.dequant import GGML_Q4_K, GGML_Q5_K, row_bytes
+
+        def _rb(n: int, ty: int) -> int:
+            return row_bytes(((n + 255) // 256) * 256, ty)
+
+        per_expert = 2 * I * _rb(H, GGML_Q4_K) + H * _rb(I, GGML_Q5_K)
     elif expert_quant == "nvfp4":
         globals_bytes = (2 * I + H) * 2 if nvfp4_native else 0
         per_expert = 2 * I * (H // 2 + H // 16) + H * (I // 2 + I // 16) + globals_bytes

@@ -48,3 +48,12 @@ def test_bad_mem_size_rejected():
         parse_args([*PATH_ARGS, "--gpu-mem", "16X"])
     with pytest.raises(SystemExit):
         parse_args([*PATH_ARGS, "--cpu-mem", "0G"])
+
+
+def test_cpu_mem_mode_default_and_choices():
+    args = _parse("--cpu-mem", "9G")
+    assert args.cpu_mem_mode == "expert"  # the default
+    args = _parse("--cpu-mem", "9G", "--cpu-mem-mode", "layer")
+    assert args.cpu_mem_mode == "layer"
+    with pytest.raises(SystemExit):
+        _parse("--cpu-mem", "9G", "--cpu-mem-mode", "bananas")

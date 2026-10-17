@@ -100,6 +100,7 @@ def _ensure_experts_hybrid_gpu(
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
+    host_slot = getattr(cache, "host_slot_for_id", None)  # None -> never-dereferenced dummies
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -112,6 +113,8 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        host_slot if host_slot is not None else cache.expert_recency,
+        cache.host_usage if host_slot is not None else cache.usage,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
@@ -121,6 +124,7 @@ def _ensure_experts_hybrid_gpu(
         BLOCK_E=block_e,
         BLOCK_C=block_c,
         BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        HAS_HOST_POOL=host_slot is not None,
         num_warps=num_warps,
     )
 
@@ -150,6 +154,17 @@ def _ensure_experts_hybrid_cpu(
             cache.usage[slot] = step
 
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
+    host_slot = getattr(cache, "host_slot_for_id", None)
+    if host_slot is not None:
+        # Global pinned host pool (--cpu-mem expert): only pool-resident misses are fetch
+        # candidates and their copy rows are POOL slot ids, bit-identical to the GPU kernel.
+        row = host_slot[layer_id]
+        step_now = int(cache.step.item())
+        for e in seen:
+            hs = int(row[e].item())
+            if hs >= 0:
+                cache.host_usage[hs] = step_now
+        missing = [e for e in missing if int(row[e].item()) >= 0]
     if _HYBRID_FETCH_BY_RECENCY:
         rec = cache.expert_recency[layer_id].tolist()
         missing.sort(key=lambda e: (-rec[e], e))
@@ -176,7 +191,10 @@ def _ensure_experts_hybrid_cpu(
         cache.usage[victim] = step
         usage[victim] = step
         cache.evict_slots[idx] = victim
-        cache.src_indices[idx] = expert  # layer-local row
+        if host_slot is not None:
+            cache.src_indices[idx] = int(host_slot[layer_id, expert].item())  # pool slot row
+        else:
+            cache.src_indices[idx] = expert  # layer-local row
 
     if _HYBRID_FETCH_BY_RECENCY:
         for expert in seen:
@@ -300,6 +318,8 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    host_slot_ptr,
+    host_usage_ptr,
     layer_id,
     num_active,
     max_fetch,
@@ -309,6 +329,7 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    HAS_HOST_POOL: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -325,7 +346,18 @@ def _ensure_experts_hybrid_kernel(
     most-recently active before this step (LRU on the expert, via ``expert_recency``),
     breaking ties toward the lower expert id -- this prioritizes *recurring* misses for
     caching, lowering the steady miss rate. Otherwise the lowest expert ids are fetched
-    (``missing_rank``), the original routing-blind heuristic."""
+    (``missing_rank``), the original routing-blind heuristic.
+
+    ``HAS_HOST_POOL`` (the --cpu-mem expert budget) narrows fetch candidates to experts
+    holding a slot in the global pinned host pool: ``host_slot_ptr`` is a flat ``[L, E]``
+    int32 table (host pool slot id, or -1). Only pool-resident misses are scheduled for
+    copy -- and their ``src_indices`` rows are POOL slot ids (the pool is one contiguous
+    pinned tensor per bank, shared across layers) -- because the file-backed banks have no
+    device alias the fused gather could dereference. Non-resident misses always overflow
+    to the CPU (which reads the file banks directly). Resident misses beyond the cap also
+    overflow to the CPU; the pool rows are ordinary host memory, CPU-readable. The pool's
+    occupancy is re-planned between decode steps on the host (``maintain_host_pool``),
+    so this table's VALUES change between graph replays while its address stays fixed."""
     step = tl.load(step_ptr) + 1
     tl.store(step_ptr, step)
     base = layer_id * num_experts
@@ -340,6 +372,11 @@ def _ensure_experts_hybrid_kernel(
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
+    if HAS_HOST_POOL:
+        host_slot = tl.load(host_slot_ptr + base + off_e, mask=e_mask, other=-1)
+        # bump the pool LRU for every active pool-resident expert
+        tl.store(host_usage_ptr + host_slot, step, mask=e_mask & (host_slot >= 0))
+        is_missing = is_missing & (host_slot >= 0)
     num_missing = tl.sum(is_missing.to(tl.int32))
     # Cap the fetches; the overflow misses are computed on the CPU (left non-resident).
     if fetch_frac_q16 > 0:
@@ -394,7 +431,11 @@ def _ensure_experts_hybrid_kernel(
             tl.store(slot_for_id_ptr + base + e, victim)
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
-            tl.store(src_indices_ptr + i, e)  # layer-local row
+            if HAS_HOST_POOL:
+                # the copy gathers from the pinned host POOL, indexed by pool slot
+                tl.store(src_indices_ptr + i, tl.load(host_slot_ptr + base + e))
+            else:
+                tl.store(src_indices_ptr + i, e)  # layer-local row
             u = tl.where(off_c == victim, 9223372036854775807, u)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----

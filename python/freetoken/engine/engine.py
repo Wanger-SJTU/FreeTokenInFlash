@@ -527,18 +527,27 @@ class Engine:
             gpu_budget=config.gpu_mem_budget,
         )
 
-    def _plan_host_residency(self, config: EngineConfig) -> tuple[list[str] | None, str | None]:
-        """--cpu-mem plan: per-layer ``"pinned"``/``"pageable"`` for the expert host banks.
+    def _plan_host_residency(
+        self, config: EngineConfig
+    ) -> tuple[list[str] | None, str | None, int | None]:
+        """--cpu-mem plan for the expert host banks: per-layer ``"pinned"``/``"pageable"``
+        (mode layer), or mode expert -- every layer file-backed plus a GLOBAL pinned
+        host pool of N expert slots shared across all layers (the budget buys N slots;
+        which (layer, expert) pairs hold them is re-planned at runtime by the pool LRU).
 
-        None when no budget is set (every layer pinned -- the historical behavior). The
-        plan runs BEFORE the bank load: spilled (pageable) layers allocate file-backed
-        spill banks, decode on the CPU executor, and -- for nvfp4 -- flip the bank layout
-        to the CPU-readable native one, so the estimate plans on native bytes whenever a
-        budget is active (conservative for the smaller marlin/b12x layouts, exact once any
-        layer spills)."""
+        (None, None, None) when no budget is set (every layer pinned). The plan runs
+        BEFORE the bank load: spilled (pageable) layers allocate file-backed spill
+        banks, decode on the CPU executor, and -- for nvfp4 -- flip the bank layout to
+        the CPU-readable native one, so the estimate plans on native bytes whenever a
+        budget is active (conservative for the smaller marlin/b12x layouts, exact once
+        any layer spills)."""
         if config.cpu_mem_budget is None:
-            return None, None
-        from freetoken.engine.cache_budget import estimate_layer_bank_bytes, plan_host_residency
+            return None, None, None
+        from freetoken.engine.cache_budget import (
+            estimate_layer_bank_bytes,
+            plan_host_pool_slots,
+            plan_host_residency,
+        )
 
         mc = config.model_config
         num_moe_layers = mc.num_moe_layers
@@ -551,21 +560,55 @@ class Engine:
             nvfp4_native=True,
             moe_weight_format=getattr(mc, "moe_weight_format", None),
         )
+        # Default spill dir is the model directory; a single-file checkpoint (GGUF)
+        # spills next to the file instead.
+        spill_dir = config.cpu_mem_spill_dir or (
+            os.path.dirname(config.model_path)
+            if os.path.isfile(config.model_path)
+            else config.model_path
+        )
+        if config.cpu_mem_mode == "expert":
+            total_experts = num_moe_layers * mc.num_experts
+            n_slots = plan_host_pool_slots(
+                num_moe_layers, layer_bytes, mc.num_experts, config.cpu_mem_budget
+            )
+            if n_slots >= total_experts:
+                logger.info_rank0(
+                    f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (expert): covers every "
+                    f"expert of all {num_moe_layers} MoE layers (~{mem_GB(layer_bytes)} per "
+                    "layer); pinning whole layers"
+                )
+                return ["pinned"] * num_moe_layers, None, None
+            if n_slots == 0:
+                logger.warning_rank0(
+                    f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (expert) is below one expert "
+                    "slot; falling back to the layer plan (which will pin nothing)"
+                )
+                plan = plan_host_residency(num_moe_layers, layer_bytes, config.cpu_mem_budget)
+                return plan, spill_dir, None
+            per_expert = max(1, layer_bytes // mc.num_experts)
+            logger.info_rank0(
+                f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (expert): global host pool of "
+                f"{n_slots}/{total_experts} expert slots (~{mem_GB(n_slots * per_expert)}, "
+                "shared across all MoE layers, round-robin warmed, LRU re-planned per "
+                f"step); the banks live file-backed under {spill_dir!r} and misses beyond "
+                "the pool decode on the CPU"
+            )
+            return ["pageable"] * num_moe_layers, spill_dir, n_slots
         plan = plan_host_residency(num_moe_layers, layer_bytes, config.cpu_mem_budget)
-        spill_dir = config.cpu_mem_spill_dir or config.model_path
         pinned = plan.count("pinned")
         if pinned == num_moe_layers:
             logger.info_rank0(
-                f"--cpu-mem {mem_GB(config.cpu_mem_budget)}: all {num_moe_layers} MoE "
+                f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (layer): all {num_moe_layers} MoE "
                 f"layers pinned (~{mem_GB(layer_bytes)} per layer)"
             )
         else:
             logger.info_rank0(
-                f"--cpu-mem {mem_GB(config.cpu_mem_budget)}: pinning {pinned}/{num_moe_layers} "
+                f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (layer): pinning {pinned}/{num_moe_layers} "
                 f"MoE layers (~{mem_GB(layer_bytes)} per layer); the rest spill to file-backed "
                 f"banks under {spill_dir!r} and decode on the CPU executor"
             )
-        return plan, spill_dir
+        return plan, spill_dir, None
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -584,9 +627,13 @@ class Engine:
             )
         # --cpu-mem first: spilled layers join the CPU-decode set, and the (possibly
         # larger) cpu_layer_ids set decides the decode target + native bank layout.
-        layer_backing, spill_dir = self._plan_host_residency(config)
+        # The expert mode instead builds a global pinned host pool: banks stay
+        # file-backed, decode runs hybrid -- pool-resident misses fused-gather from
+        # the pinned pool, the rest on the CPU executor.
+        layer_backing, spill_dir, host_pool_slots = self._plan_host_residency(config)
         # decode_target picks the bank layout + the per-decode mechanism:
-        #   "hybrid" -> GPU-cache + CPU-overflow co-compute, every layer (--moe-backend hybrid);
+        #   "hybrid" -> GPU-cache + CPU-overflow co-compute, every layer (--moe-backend
+        #               hybrid, or any offload backend with a --cpu-mem host pool);
         #   "cpu"    -> CPU executor for the cpu_layer_ids set (all layers under --moe-backend
         #               cpu, the --moe-cpu-layers subset under offload, the --cpu-mem spilled
         #               layers under any offload backend);
@@ -596,16 +643,31 @@ class Engine:
         # gates the CPU executor build below.
         cpu_layer_ids = _resolve_cpu_layers(config, config.model_config.num_moe_layers)
         if layer_backing is not None:
-            spilled = {l for l, b in enumerate(layer_backing) if b != "pinned"}
-            if spilled and not _cpu_executor_supports_act(config.model_config):
-                raise ValueError(
-                    f"--cpu-mem: {len(spilled)} MoE layer(s) spill past the host budget and "
-                    "decode on the CPU executor, which does not support this model's expert "
-                    f"activation {getattr(config.model_config, 'hidden_act', None)!r}; raise "
-                    "--cpu-mem to pin every layer or drop the flag"
-                )
-            cpu_layer_ids = frozenset(cpu_layer_ids | spilled)
-        if config.moe_backend == "hybrid":
+            needs_cpu_executor = host_pool_slots is not None or any(
+                b != "pinned" for b in layer_backing
+            )
+            if needs_cpu_executor:
+                if not _cpu_executor_supports_act(config.model_config):
+                    raise ValueError(
+                        "--cpu-mem: part of the expert banks decode on the CPU executor, "
+                        "which does not support this model's expert activation "
+                        f"{getattr(config.model_config, 'hidden_act', None)!r}; raise --cpu-mem "
+                        "to pin every layer or drop the flag"
+                    )
+                if not _cpu_executor_supports_format(config.model_config):
+                    raise NotImplementedError(
+                        "--cpu-mem (and --moe-backend cpu/hybrid) compute experts on the "
+                        "CPU executor, which does not support this checkpoint's expert "
+                        f"format {_expert_bank_format(config.model_config)!r} (checked before "
+                        "the bank load); serve without --cpu-mem, or add CPU kernels for "
+                        "the format"
+                    )
+            if host_pool_slots is None:
+                spilled = {l for l, b in enumerate(layer_backing) if b != "pinned"}
+                cpu_layer_ids = frozenset(cpu_layer_ids | spilled)
+        if config.moe_backend == "hybrid" or (
+            host_pool_slots is not None and config.moe_backend != "cpu"
+        ):
             decode_target = "hybrid"
         elif cpu_layer_ids:
             decode_target = "cpu"
@@ -667,6 +729,11 @@ class Engine:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
+        if host_pool_slots is not None:
+            # Expert mode: build the global pinned host pool (mapping table + LRU +
+            # registered pool tensors) before any CUDA graph capture -- and before
+            # _resolve_hybrid_fetch, whose no-profile default consults the pool.
+            cache.set_host_expert_pool(host_pool_slots)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         cache.cpu_layer_ids = cpu_layer_ids
@@ -699,6 +766,18 @@ class Engine:
         gpu_name = torch.cuda.get_device_name(self.device) if torch.cuda.is_available() else None
         fraction = load_hybrid_fetch_fraction(cache.quant_format, gpu_name=gpu_name)
         if fraction is None:
+            if cache.host_pool:
+                # Pooled decode without a benched balance: fetch every POOL-resident
+                # miss over PCIe (the mask already excludes the rest). The pinned
+                # bytes are one hop away; leaving them for the CPU would waste the
+                # pool. Run `ft bench bw` for the calibrated overlap split.
+                cache.hybrid_max_fetch = cache.num_experts  # inert cap
+                logger.info_rank0(
+                    "--moe-hybrid-max-fetch auto: no `ft bench bw` profile for "
+                    f"{cache.quant_format!r} experts; fetching every pool-resident "
+                    "miss over PCIe (run `ft bench bw` to calibrate the CPU split)"
+                )
+                return
             cache.hybrid_max_fetch = 1
             logger.warning_rank0(
                 "--moe-hybrid-max-fetch auto: no usable `ft bench bw` profile for "
@@ -966,6 +1045,9 @@ class Engine:
             # One pinned read: surfaces a fired flag-handshake watchdog (dead coordinator
             # -> stale expert outputs) as a loud error instead of silent corruption.
             self.cpu_moe_executor.raise_if_unhealthy()
+        cache = self.moe_offload_cache
+        if cache is not None and cache.host_pool:
+            self._maintain_host_pool(cache)
 
         for req in batch.reqs:
             req.complete_one()
@@ -976,6 +1058,19 @@ class Engine:
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
+
+    _HOST_POOL_MAINTAIN_EVERY = max(
+        1, int(os.getenv("FREETOKEN_HOST_POOL_MAINTAIN_EVERY", "16"))
+    )
+
+    def _maintain_host_pool(self, cache) -> None:
+        """Between-steps host-pool re-planning (promote hot unpinned experts, demote
+        cold slots). Throttled: the ranking's D2H reads sync the stream, so the cost
+        lands on one step in ``_HOST_POOL_MAINTAIN_EVERY``."""
+        self._host_pool_steps = getattr(self, "_host_pool_steps", 0) + 1
+        if self._host_pool_steps % self._HOST_POOL_MAINTAIN_EVERY:
+            return
+        cache.maintain_host_pool()
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
@@ -1177,6 +1272,22 @@ _CPU_MOE_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh", "swi
 def _cpu_executor_supports_act(model_config) -> bool:
     act = getattr(model_config, "hidden_act", "silu")
     return act in _CPU_MOE_ACTS or getattr(model_config, "moe_weight_format", None) == "mxfp4"
+
+
+def _expert_bank_format(model_config) -> str:
+    """The bank quant_format (an ``_BANK_SCHEMAS`` key) a checkpoint's experts resolve
+    to, using the same conventions as ``estimate_layer_bank_bytes`` -- for early
+    capability checks that must run before any bank is loaded."""
+    q = model_config.expert_quant
+    if q == "none" and (getattr(model_config, "moe_weight_format", None) or None) == "mxfp4":
+        return "mxfp4_triton"
+    return "bf16" if q == "none" else q
+
+
+def _cpu_executor_supports_format(model_config) -> bool:
+    from freetoken.moe.cpu_executor import _WFMT_IDS
+
+    return _expert_bank_format(model_config) in _WFMT_IDS
 
 
 # MoE-only knobs and the value each resolves to on a dense model. moe_backend is handled

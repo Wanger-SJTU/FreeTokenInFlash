@@ -319,16 +319,22 @@ def _alloc_expert_bank(
     dtype: torch.dtype,
     backing: str = "anon",
     spill_dir: str | None = None,
+    split_experts: int | None = None,
 ):
     """Allocate an UNPINNED bank (lazy host mmap), to be filled then pinned at the end --
     pin-after-fill. Registering already-resident pages skips cudaHostAlloc's slow commit
     (~2.8 GiB/s) / zero-fill. Returns a bank object exposing ``.tensor`` and ``.pin()``.
     ``backing="file"`` (--cpu-mem spill) allocates over an unlinked tmpfile instead: the
-    filled pages are dropped after fill and re-fault from disk on demand."""
+    filled pages are dropped after fill and re-fault from disk on demand.
+    ``backing="split"`` (--cpu-mem expert) straddles the two: an anonymous, pin-able
+    prefix of ``split_experts`` experts then a file-backed suffix."""
     if torch.cuda.is_available():
         from freetoken.moe.host_banks import HostBank
 
-        return HostBank(tuple(shape), dtype, backing=backing, spill_dir=spill_dir)
+        return HostBank(
+            tuple(shape), dtype, backing=backing, spill_dir=spill_dir,
+            split_experts=split_experts,
+        )
     return _PlainBank(torch.empty(shape, dtype=dtype))
 
 
@@ -344,6 +350,7 @@ def _copy_expert_layer_into_bank(
     dtype: torch.dtype,
     backing: str = "anon",
     spill_dir: str | None = None,
+    split_experts: int | None = None,
 ) -> None:
     if layer < 0 or layer >= config.num_layers:
         raise ValueError(
@@ -365,7 +372,7 @@ def _copy_expert_layer_into_bank(
     if bank is None:
         banks[bank_name][layer] = bank = _alloc_expert_bank(
             (config.num_experts, *tensor.shape[1:]), dtype=dtype,
-            backing=backing, spill_dir=spill_dir,
+            backing=backing, spill_dir=spill_dir, split_experts=split_experts,
         )
     bank.tensor.copy_(tensor)  # whole-layer arrival; pinned later, after fully resident
     seen_layers[bank_name].add(layer)
@@ -399,10 +406,12 @@ def stream_moe_expert_sources(
     """
     from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline
 
-    def _backing_for(layer: int) -> str:
+    def _backing_for(layer: int) -> tuple[str, int | None]:
         if layer_backing is None:
-            return "anon"
-        return "anon" if layer_backing[layer] == "pinned" else "file"
+            return "anon", None
+        from freetoken.moe.host_banks import parse_layer_backing
+
+        return parse_layer_backing(layer_backing[layer])
 
     banks: dict[str, list] = {  # name -> per-layer [bank obj (HostBank/_PlainBank) or None]
         "gate_up": [None] * config.num_layers,
@@ -419,6 +428,7 @@ def stream_moe_expert_sources(
                 raise ValueError(f"Unexpected expert weight key: {name}")
             layer, packed_name = expert_info
             bank_name = "gate_up" if packed_name == "gate_up_proj" else "down"
+            backing, split_k = _backing_for(layer)
             _copy_expert_layer_into_bank(
                 banks,
                 row_shape,
@@ -428,8 +438,9 @@ def stream_moe_expert_sources(
                 layer=layer,
                 config=config,
                 dtype=dtype,
-                backing=_backing_for(layer),
+                backing=backing,
                 spill_dir=spill_dir,
+                split_experts=split_k,
             )
             tracker.note(layer)
 

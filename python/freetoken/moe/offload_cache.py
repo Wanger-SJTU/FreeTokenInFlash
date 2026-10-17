@@ -237,6 +237,21 @@ class OffloadMoeCache:
         self._copy_dst_ptrs: torch.Tensor | None = None
         self._copy_src_ptrs: list[torch.Tensor] | None = None
         self._copy_feat_bytes: torch.Tensor | None = None
+        # Global pinned host pool (--cpu-mem-mode expert): ``host_pool_size`` expert
+        # slots shared across ALL layers as one contiguous pinned tensor per bank --
+        # the host-side mirror of the unified GPU slot cache. ``host_slot_for_id``
+        # ([L, E] int32, -1 = not pinned) is read by the hybrid ensure kernel each
+        # replay (fixed address; VALUES re-planned between decode steps by
+        # maintain_host_pool), and ``host_usage`` ([N]) is the pool-slot LRU the kernel
+        # bumps for every active resident expert. The pool holds COPIES (source of
+        # truth stays the file-backed banks), so eviction is free.
+        self.host_pool_size = 0
+        self.host_pool: dict[str, torch.Tensor] = {}  # [N, *row_shape] pinned per bank
+        self.host_slot_for_id: torch.Tensor | None = None  # [L, E] int32 device
+        self._host_slot_mirror: torch.Tensor | None = None  # same, host-side truth
+        self._pool_owner: torch.Tensor | None = None  # [N, 2] int32: slot -> (layer, expert)
+        self.host_usage: torch.Tensor | None = None  # [N] int64 device
+        self._pool_src_ptrs: torch.Tensor | None = None  # [num_banks] int64 device
         # The layer whose misses ensure_experts/materialize_layer staged last; consumed
         # by copy_missing to pick the per-layer source (part of the same pending-copy
         # state as evict_slots/src_indices/num_indices).
@@ -280,11 +295,16 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all
-        pinned). Non-pinned layers are FILE-BACKED spill banks (the --cpu-mem budget's
+        pinned). PAGEABLE layers are FILE-BACKED spill banks (the --cpu-mem layer budget's
         over-budget layers): the GPU movement kernels cannot dereference them, so they
         are never pinned, never part of the fused copy plan, and must decode on the CPU
         executor (the engine folds them into ``cpu_layer_ids``); ``copy_missing`` serves
         their prefill materialization through a torch fallback instead of the fused copy.
+        SPLIT layers (--cpu-mem-mode expert) straddle both backings in one contiguous
+        tensor -- a registered anonymous prefix (first ``split_experts`` rows) plus a
+        file-backed suffix; decode routes through the masked hybrid fetch (resident
+        misses fused-gather from the prefix, the rest compute on the CPU executor) while
+        prefill materializes through the same torch fallback as PAGEABLE layers.
         """
         from freetoken.moe.host_banks import HostResidency
 
@@ -294,9 +314,10 @@ class OffloadMoeCache:
         )
         residency = layer_residency or [HostResidency.PINNED.value] * self.num_layers
         assert len(residency) == self.num_layers, (len(residency), self.num_layers)
-        if any(r not in (HostResidency.PINNED.value, HostResidency.PAGEABLE.value) for r in residency):
+        _served = (HostResidency.PINNED.value, HostResidency.PAGEABLE.value, HostResidency.SPLIT.value)
+        if any(r not in _served for r in residency):
             raise NotImplementedError(
-                "only pinned and file-backed pageable host bank layers are served; "
+                "only pinned, split and file-backed pageable host bank layers are served; "
                 "LOCKED residency is platform-specific and not implemented"
             )
         self.layer_residency = list(residency)
@@ -321,6 +342,96 @@ class OffloadMoeCache:
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
 
+    def set_host_expert_pool(self, num_slots: int, *, warm: bool = True) -> None:
+        """Build the global pinned host pool (--cpu-mem-mode expert): ``num_slots``
+        expert slots shared across ALL layers, one contiguous (page-aligned, then
+        cudaHostRegister'd) tensor per bank -- the host mirror of the unified GPU slot
+        cache. Call AFTER set_bank_sources and BEFORE CUDA graph capture (the mapping
+        table's address must be fixed for the cache's lifetime; only its values change,
+        between decode steps, via :meth:`maintain_host_pool`).
+
+        ``warm=True`` fills the pool round-robin (expert id major, layer id minor) from
+        the freshly loaded banks, so every layer starts with ``num_slots // L`` pinned
+        experts before routing statistics exist; the runtime LRU then re-plans it."""
+        assert self.banks, "set_bank_sources must register the banks first"
+        assert 0 < num_slots < self.num_layers * self.num_experts, num_slots
+        from freetoken.moe.host_banks import HostBank, pin_banks
+
+        self.host_pool_size = num_slots
+        pools = {}
+        for name in self.bank_schema:
+            src = self.bank_sources[name][0]
+            pools[name] = HostBank((num_slots, *src.shape[1:]), src.dtype)  # anon, lazy
+        self.host_pool = {name: hb.tensor for name, hb in pools.items()}
+
+        mirror = torch.full(
+            (self.num_layers, self.num_experts), -1, dtype=torch.int32
+        )
+        owner = torch.full((num_slots, 2), -1, dtype=torch.int32)
+        # Round-robin warm: expert 0 of every layer, then expert 1 of every layer, ...
+        order = [
+            (l, e) for e in range(self.num_experts) for l in range(self.num_layers)
+        ][:num_slots]
+        if warm:
+            for slot, (l, e) in enumerate(order):
+                for name in self.bank_schema:
+                    self.host_pool[name][slot].copy_(self.bank_sources[name][l][e])
+                mirror[l, e] = slot
+                owner[slot, 0] = l
+                owner[slot, 1] = e
+        self._host_slot_mirror = mirror
+        self._pool_owner = owner
+        self.host_slot_for_id = mirror.to(self.device)
+        self.host_usage = torch.zeros(num_slots, dtype=torch.int64, device=self.device)
+        if torch.cuda.is_available():
+            pin_banks(pools)  # pin-after-fill (CUDA-less hosts keep pageable pools)
+        self._build_copy_plan()
+
+    def maintain_host_pool(self, promote_per_call: int = 2) -> int:
+        """Re-plan the host pool between decode steps (host-side; never inside a CUDA
+        graph). Promotes the hottest experts that are NOT yet pinned (by
+        ``expert_recency``, which the ensure kernel bumps for every active expert --
+        high recency without a host slot means it decoded on the CPU) into the
+        least-recently-used pool slots (by ``host_usage``, which the kernel bumps for
+        every active pinned expert). The pool holds copies, so a demoted slot needs no
+        writeback. Returns the number of promotions."""
+        if not self.host_pool or self._host_slot_mirror is None:
+            return 0
+        rec = self.expert_recency.cpu().flatten()
+        mirror = self._host_slot_mirror
+        unpinned = (mirror < 0).view(-1)
+        candidates = (rec > 0) & unpinned
+        if not bool(candidates.any()):
+            return 0
+        cand_ids = candidates.nonzero(as_tuple=False).view(-1)
+        top = cand_ids[rec[cand_ids].argsort(descending=True)][:promote_per_call]
+
+        owner = self._pool_owner
+        usage = self.host_usage.cpu()
+        free = (owner[:, 0] < 0).nonzero(as_tuple=False).view(-1).tolist()
+        # Victim order: free slots first, then least-recently-used pinned ones.
+        victim_order = free + usage.argsort().tolist()
+        victims = victim_order[: len(top)]
+        if len(victims) < len(top):
+            return 0
+        L, E = self.num_layers, self.num_experts
+        promoted = 0
+        for flat, slot in zip(top.tolist(), victims):
+            l, e = flat // E, flat % E
+            vl, ve = int(owner[slot, 0]), int(owner[slot, 1])
+            if vl >= 0:  # demote the victim's mapping (no writeback: pool rows are copies)
+                mirror[vl, ve] = -1
+            for name in self.bank_schema:
+                self.host_pool[name][slot].copy_(self.bank_sources[name][l][e])
+            mirror[l, e] = slot
+            owner[slot, 0] = l
+            owner[slot, 1] = e
+            self.host_usage[slot] = 0
+            promoted += 1
+        if promoted:
+            self.host_slot_for_id.copy_(self._host_slot_mirror, non_blocking=True)
+        return promoted
+
     def _build_copy_plan(self) -> None:
         """Precompute the fused multi-bank copy descriptor (base addrs + per-row bytes).
 
@@ -330,11 +441,18 @@ class OffloadMoeCache:
         layer's bank source addresses is not resolvable to a device alias (file-backed
         spilled banks are not registered) or not 16-byte aligned, or globally via
         FREETOKEN_FUSED_COPY=0.
-        """
+
+        SPLIT-residency layers stay out of the fused plan (their prefill copies must take
+        the torch fallback -- prefill fetches include non-resident rows). The global
+        pinned HOST POOL gets its own pointer tensor for the masked decode fetch: one
+        base per bank, layer-invariant (the pool is shared across layers); it bypasses
+        the FUSED_COPY kill switch because the masked fetch has no capture-legal
+        fallback."""
         self._copy_fused_ok = False
         self._copy_dst_ptrs = None
         self._copy_src_ptrs = None
         self._copy_feat_bytes = None
+        self._pool_src_ptrs = None
         self._copy_dst_ptrs_host: list[int] = []
         self._copy_src_ptrs_host: list[list[int]] = []
         self._copy_feat_bytes_host: list[int] = []
@@ -342,17 +460,45 @@ class OffloadMoeCache:
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
         self._layer_fused_ok: list[bool] = [False] * self.num_layers
-        if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
+        if self.device.type != "cuda" or not self.banks:
+            return
+
+        # Layer-invariant geometry, needed by both the fused plan and the pool fetch.
+        dst_ptrs, feats = [], []
+        for per_layer, cache in self.banks:
+            feats.append(math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size())
+            dst_ptrs.append(cache.data_ptr())
+        aligned = all(f % 16 == 0 and d % 16 == 0 for f, d in zip(feats, dst_ptrs))
+
+        # Host pool first: the masked decode fetch (pool gather) has no capture-legal
+        # fallback, so it ignores the FUSED_COPY kill switch. The pool tensors are
+        # freshly cudaHostRegister'd, so their bases are device-aliasable directly.
+        if self.host_pool and aligned:
+            ptrs = [self.host_pool[name].data_ptr() for name in self.bank_schema]
+            if all(p % 16 == 0 for p in ptrs):
+                self._pool_src_ptrs = torch.tensor(ptrs, dtype=torch.int64, device=self.device)
+                self._copy_dst_ptrs = torch.tensor(dst_ptrs, dtype=torch.int64, device=self.device)
+                self._copy_feat_bytes = torch.tensor(feats, dtype=torch.int64, device=self.device)
+
+        if not _FUSED_COPY or not aligned:
             return
         from freetoken.kernel.pinned import device_ptr
+        from freetoken.moe.host_banks import HostResidency
 
-        dst_ptrs, feats = [], []
+        split_set = {
+            l for l, r in enumerate(self.layer_residency)
+            if r == HostResidency.SPLIT.value
+        } if self.layer_residency else set()
         layer_src_ptrs: list[list[int] | None] = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
-            feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
-            if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
-                return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
+                if layer_id in split_set:
+                    # Split layers stay out of the UNMASKED fused plan: under UVA the
+                    # device-alias probe succeeds (the registered prefix shares the
+                    # tensor base), but prefill fetches include non-resident rows,
+                    # which the masked decode fetch alone is guaranteed to exclude.
+                    layer_src_ptrs[layer_id] = None
+                    continue
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
                 # Windows/WDDM). File-backed spill banks have none: that layer falls
@@ -368,8 +514,6 @@ class OffloadMoeCache:
                     layer_src_ptrs[layer_id] = None
                     continue
                 layer_src_ptrs[layer_id].append(src_dev)
-            dst_ptrs.append(cache.data_ptr())
-            feats.append(feat)
         self._layer_fused_ok = [
             ptrs is not None and len(ptrs) == len(feats) for ptrs in layer_src_ptrs
         ]
@@ -961,10 +1105,29 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
-    def copy_missing(self) -> None:
+    def copy_missing(self, masked: bool = False) -> None:
+        """Fetch this layer's staged misses into the slot cache.
+
+        ``masked=True`` (the host-pool decode path) requires that the staged indices
+        came from the pool-aware hybrid ensure kernel -- every src row is then a POOL
+        slot id and the fused gather over the registered pool tensors is safe under
+        CUDA graph capture. Unmasked callers (prefill, whole-pinned decode) use the
+        layer's regular plan; file-backed layers fall to the torch staging path."""
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if masked and self._pool_src_ptrs is not None:
+            from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
+
+            fast_index_copy_multi_jit(
+                self._copy_dst_ptrs,
+                self._pool_src_ptrs,
+                self._copy_feat_bytes,
+                self.evict_slots,
+                self.src_indices,
+                self.num_indices,
+            )
+            return
         if self._copy_fused_ok and self._layer_fused_ok[layer_id]:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 

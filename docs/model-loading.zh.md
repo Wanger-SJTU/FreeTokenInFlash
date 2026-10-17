@@ -196,14 +196,26 @@ self.model.load_state_dict(self._load_weight_state_dict(config))
   （checkpoint/ftw.py:404）。
 - 模型可自定义 `make_offload_moe_cache` 接管构建；随后调模型的
   `prepare_for_runtime()` 钩子（:336）做后处理。
-- **内存预算 `--cpu-mem`（层级驻留）**：给了预算时 `_plan_host_residency`
-  （engine/engine.py）先用 `estimate_layer_bank_bytes`/`plan_host_residency`
-  （engine/cache_budget.py，纯函数）按层贪心切分 pinned/可换出，再把 per-layer
-  `layer_backing` 计划穿进 `load_expert_banks`：预算内的层照旧 pin-after-fill，
-  装不下的层分配成**文件后备** spill bank（`HostBank(backing="file")`，host_banks.py
-  ——model 目录下的 tmpfile + `MAP_SHARED` mmap，填完 `drop_pages()` 丢页，访问时
-  从磁盘按需缺页，常驻内存由页缓存封顶）。spill 层并入 `cpu_layer_ids`，decode 走
-  CPU executor（GPU 快路径只服务 pinned 层）。启动时生效，不支持运行时重规划。
+- **内存预算 `--cpu-mem`（host 驻留）**：给了预算时 `_plan_host_residency`
+  （engine/engine.py）按 `--cpu-mem-mode` 生成驻留计划，再穿进 `load_expert_banks`。
+  两种模式（均启动时生效）：
+  - **`expert`（默认，全局共享专家池）**：`plan_host_pool_slots`
+    （engine/cache_budget.py，纯函数）把预算折算成 N 个 pinned 专家槽位，构成
+    **跨所有 MoE 层共享的一个全局 host 池**（GPU slot cache 的主机侧镜像）。
+    全部 bank 以文件后备加载（页缓存管常驻，CPU executor 直读、缺页透明）；
+    池是每 bank 一个 `[N, rows]` 的注册 pinned 张量（`set_host_expert_pool`，
+    启动时轮转预热：先每层各 pin 第 0 个专家、再第 1 个……）。decode 全层走
+    hybrid：`_ensure_experts_hybrid_kernel` 读 `host_slot_for_id [L,E]` int32 表
+    （-1 = 不在池），取回候选 = missing ∩ 在池，且 `src_indices` 直接写**池槽号**；
+    `copy_missing(masked=True)` 用池基址 fused gather（地址固定，图捕获安全），
+    不在池的 miss 写 -1 交 CPU executor。每步之间（`forward_batch` 尾部，默认
+    每 16 步、`FREETOKEN_HOST_POOL_MAINTAIN_EVERY` 可调）`maintain_host_pool`
+    按 `expert_recency`（kernel 每步都在维护）把最热但未入池的专家升入
+    `host_usage` 最冷的槽——池里是**副本**，降级无需回写。prefill 不变：miss 走
+    torch staging。
+  - **`layer`（层级贪心，旧行为）**：`plan_host_residency` 按层号顺序整层
+    pinned/可换出；spill 层是整段文件后备 bank，并入 `cpu_layer_ids`，decode 整层
+    走 CPU executor（GPU 快路径只服务 pinned 层）。
 - **显存预算 `--gpu-mem`（绝对值）**：`resolve_moe_cache_auto` / `_startup_kv_budget`
   的预算来源从 `memory_ratio × 空闲显存` 换成 `gpu_mem_budget − 已消耗`，槽位数与 KV
   页数在预算内 MoE 优先重解；graph/activation 在预算之上，初始化完校验超限告警。
