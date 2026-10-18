@@ -32,6 +32,22 @@ def load_gguf_tokenizer(model_path: str):
 
     tokens = tok_dict["tokens"]
 
+    # transformers' GGUF converter registers only a handful of special tokens (on the
+    # qwen35moe UD file: <|endoftext|>/<|im_end|> make it into added_tokens, but
+    # <|im_start|> does NOT) -- the rest then BPE-split and the chat template derails
+    # into garbage. Mark EVERY control / user-defined token special at its table id:
+    # tokenizers keeps the vocab id of already-present tokens, so this only makes them
+    # encode atomically (and skip in decode), never renumbers.
+    types = tok_dict.get("token_type") or []
+    if types:
+        from tokenizers import AddedToken
+
+        fast.add_special_tokens([
+            AddedToken(tokens[i], single_word=False, normalized=False, special=True)
+            for i in range(min(len(types), len(tokens)))
+            if types[i] in (3, 4)  # ggml CONTROL / USER_DEFINED
+        ])
+
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
         return tokens[int(tid)] if tid is not None and int(tid) < len(tokens) else default
