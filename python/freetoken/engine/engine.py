@@ -572,6 +572,25 @@ class Engine:
             n_slots = plan_host_pool_slots(
                 num_moe_layers, layer_bytes, mc.num_experts, config.cpu_mem_budget
             )
+            # Headroom guard: the pool is unreclaimable shared-anon on top of the
+            # serving processes' fixed overhead, and the file-backed banks keep
+            # faulting pages in at decode time -- clamp the pool so MemAvailable
+            # minus the reserve still covers it instead of OOMing mid-decode.
+            from freetoken.engine.cache_budget import clamp_pool_slots_to_headroom, host_available_bytes
+
+            headroom = max(0, int(os.getenv("FREETOKEN_CPU_MEM_HEADROOM", 2 << 30)))
+            avail = host_available_bytes()
+            fitting = clamp_pool_slots_to_headroom(
+                n_slots, max(1, layer_bytes // mc.num_experts), avail, headroom
+            )
+            if fitting < n_slots:
+                logger.warning_rank0(
+                    f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (expert): MemAvailable "
+                    f"{mem_GB(avail or 0)} minus {mem_GB(headroom)} headroom fits only "
+                    f"{fitting} of {n_slots} slots; clamping (FREETOKEN_CPU_MEM_HEADROOM "
+                    "adjusts the reserve)"
+                )
+                n_slots = fitting
             if n_slots >= total_experts:
                 logger.info_rank0(
                     f"--cpu-mem {mem_GB(config.cpu_mem_budget)} (expert): covers every "

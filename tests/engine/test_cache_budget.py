@@ -753,3 +753,22 @@ def test_plan_host_pool_slots_budget_buys_shared_slots():
     # None budget / unknown geometry -> fully pinned
     assert plan_host_pool_slots(L, layer_bytes, E, None) == total
     assert plan_host_pool_slots(L, 0, E, 1 << 40) == total
+
+
+def test_clamp_pool_slots_to_headroom():
+    """The expert pool must not plan past MemAvailable minus the headroom reserve."""
+    from freetoken.engine.cache_budget import clamp_pool_slots_to_headroom
+
+    pe = 2 << 20  # 2 MiB per expert
+    # plenty of room -> no-op
+    assert clamp_pool_slots_to_headroom(1000, pe, 8 << 30, 2 << 30) == 1000
+    # exactly at the edge
+    assert clamp_pool_slots_to_headroom(3072, pe, 8 << 30, 2 << 30) == 3072
+    # over budget -> clamped to what fits
+    assert clamp_pool_slots_to_headroom(5000, pe, 8 << 30, 2 << 30) == 3072
+    # headroom alone exceeds availability -> floors at 0 (engine falls back to the
+    # layer plan from there)
+    assert clamp_pool_slots_to_headroom(5000, pe, 1 << 30, 2 << 30) == 0
+    # unknown availability keeps the plan
+    assert clamp_pool_slots_to_headroom(5000, pe, None, 2 << 30) == 5000
+    assert clamp_pool_slots_to_headroom(0, pe, 1 << 30, 2 << 30) == 0

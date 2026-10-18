@@ -156,6 +156,34 @@ def plan_host_pool_slots(
     return max(0, min(int(budget_bytes) // per_expert, total))
 
 
+def host_available_bytes() -> int | None:
+    """/proc/meminfo MemAvailable (the OOM-relevant figure, reclaimable cache
+    included), or None when unreadable (non-Linux / no /proc)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, StopIteration):
+        pass
+    return None
+
+
+def clamp_pool_slots_to_headroom(
+    n_slots: int, per_expert: int, available: int | None, headroom: int
+) -> int:
+    """Shrink the planned pool until it fits ``available - headroom`` bytes.
+
+    The pool is unreclaimable shared-anon memory stacked on top of the serving
+    processes' fixed torch overhead, while the file-backed banks keep faulting
+    pages in at decode time -- without a reserve the box OOMs or thrashes reclaim.
+    ``available=None`` (unreadable) keeps the plan as-is."""
+    if available is None or per_expert <= 0 or n_slots <= 0:
+        return n_slots
+    fitting = max(0, available - headroom) // per_expert
+    return min(n_slots, fitting)
+
+
 def estimate_layer_bank_bytes(
     *,
     hidden_size: int,
