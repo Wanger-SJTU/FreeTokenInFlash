@@ -1,11 +1,10 @@
 from contextlib import contextmanager
 
-import platform
-
 import pytest
 import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
+from freetoken.layers.quantization import QuantKind
 
 
 def _init_tp():
@@ -13,18 +12,22 @@ def _init_tp():
         set_tp_info(rank=0, size=1)
 
 
-def _make_layer_and_cache():
+def _bf16_offload_layer(layer_id: int, num_experts: int, top_k: int, hidden_size: int, intermediate_size: int):
+    """A bf16 offload layer on the fused kernel."""
     from freetoken.layers.moe import OffloadMoELayer
+    from freetoken.layers.quantization import NoQuantConfig
+
+    return OffloadMoELayer(
+        layer_id, num_experts, top_k, hidden_size, intermediate_size,
+        quant_config=NoQuantConfig(), prefix=f"model.layers.{layer_id}.mlp.experts",
+    )
+
+
+def _make_layer_and_cache():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    layer = OffloadMoELayer(
-        layer_id=0,
-        num_experts=4,
-        top_k=2,
-        hidden_size=8,
-        intermediate_size=16,
-    )
+    layer = _bf16_offload_layer(0, 4, 2, 8, 16)
     cache = OffloadMoeCache(
         num_layers=1,
         num_experts=4,
@@ -36,34 +39,41 @@ def _make_layer_and_cache():
     return layer, cache
 
 
-def test_dummy_expert_sources_use_moe_layer_count(monkeypatch):
-    from types import SimpleNamespace
+def test_dummy_expert_banks_follow_the_kernel_layout(monkeypatch):
 
-    import freetoken.models.weight as weight
+    from freetoken.kernel import backend
+    from freetoken.layers.quantization import QuantBackend, QuantConfig, set_quant_backend
+    from freetoken.moe.expert_banks import build_expert_banks
 
     _init_tp()
-    config = SimpleNamespace(
-        num_layers=5,
-        num_moe_layers=3,
-        num_experts=4,
-        hidden_size=6,
-        moe_intermediate_size=8,
-    )
+    L, E, H, I = 3, 4, 64, 32
+    monkeypatch.setattr(backend, "device_capability", lambda: (0, 0))
+    monkeypatch.setattr(backend, "is_vllm_installed", lambda: False)
+    monkeypatch.setattr(backend, "is_flashinfer_installed", lambda: False)
 
-    gate_up, down = weight.dummy_moe_expert_sources(config, dtype=torch.float16)
+    def _bound(quant):
+        layer = _bf16_offload_layer(0, E, 2, H, I) if quant is None else None
+        if layer is None:
+            from freetoken.layers.moe import OffloadMoELayer
 
-    assert len(gate_up) == 3 and all(t.shape == (4, 16, 6) for t in gate_up)
-    assert len(down) == 3 and all(t.shape == (4, 6, 8) for t in down)
+            layer = OffloadMoELayer(0, E, 2, H, I, quant_config=quant, prefix="model.layers.0.mlp.experts")
+        return layer
 
-    monkeypatch.setattr(
-        weight,
-        "alloc_pinned_tensor",
-        lambda *shape, dtype: torch.empty(*shape, dtype=dtype),
-    )
-    banks = weight.dummy_nvfp4_expert_sources(config)
+    bf16 = _bound(None)
+    banks = build_expert_banks(bf16.quant_method, L, None, device=torch.device("cpu"), dummy=True)
+    assert banks.kind is QuantKind.NONE and set(banks.sources) == {"gate_up", "down"}
+    assert len(banks.sources["gate_up"]) == L and all(t.shape == (E, 2 * I, H) for t in banks.sources["gate_up"])
+    assert all(t.shape == (E, H, I) for t in banks.sources["down"])
 
-    assert {len(layers) for layers in banks.values()} == {3}
-    assert {t.shape[0] for layers in banks.values() for t in layers} == {4}
+    set_quant_backend(QuantBackend.parse("moe.nvfp4=triton"))
+    quant = QuantConfig.from_hf({"quantization_config": {"quant_method": "modelopt", "quant_algo": "NVFP4", "ignore": ["lm_head"]}})
+    nvfp4 = _bound(quant)
+    banks = build_expert_banks(nvfp4.quant_method, L, None, device=torch.device("cpu"), dummy=True)
+    assert banks.kind is QuantKind.NVFP4 and banks.kernel == "triton"
+    assert {len(layers) for layers in banks.sources.values()} == {L}
+    assert {t.shape[0] for layers in banks.sources.values() for t in layers} == {E}
+    assert torch.all(banks.sources["gate_up_scale"][0].float() == 1.0)
+    assert torch.all(banks.sources["gate_up_global"][0].float() > 0)
 
 
 def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypatch):
@@ -89,6 +99,8 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         got_topk_ids,
         activation,
         apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
     ):
         calls["w1"] = w1
         calls["w2"] = w2
@@ -96,7 +108,7 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
         calls["topk_ids"] = got_topk_ids.clone()
         return hidden_states
 
-    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
 
     out = layer.prefill_forward(hidden_states, router_logits)
 
@@ -114,22 +126,12 @@ def test_offload_moe_layer_prefill_forward_uses_single_layer_cache_view(monkeypa
 
 
 def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(monkeypatch):
-    from freetoken.layers.moe import OffloadMoELayer
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
     num_layers = 3
     num_experts = 4
-    layers = [
-        OffloadMoELayer(
-            layer_id=layer_id,
-            num_experts=num_experts,
-            top_k=2,
-            hidden_size=8,
-            intermediate_size=16,
-        )
-        for layer_id in range(num_layers)
-    ]
+    layers = [_bf16_offload_layer(layer_id, num_experts, 2, 8, 16) for layer_id in range(num_layers)]
     cache = OffloadMoeCache(
         num_layers=num_layers,
         num_experts=num_experts,
@@ -174,6 +176,8 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
         got_topk_ids,
         activation,
         apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
     ):
         layer_id = len(fused_calls)
         fused_calls.append(
@@ -188,7 +192,7 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
         )
         return hidden_states + layer_id
 
-    monkeypatch.setattr("freetoken.layers.moe.fused_experts_impl", fake_fused)
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
 
     out = hidden_states
     for layer in layers:
@@ -205,7 +209,7 @@ def test_offload_moe_layer_prefill_overlap_prefetches_layers_into_two_buffers(mo
     assert fused_calls[0]["w2_ptr"] == fused_calls[2]["w2_ptr"]
     assert fused_calls[0]["w1_ptr"] != fused_calls[1]["w1_ptr"]
     assert fused_calls[0]["w2_ptr"] != fused_calls[1]["w2_ptr"]
-    prefill_gate_up_buffer, prefill_down_buffer = cache.prefill_bank_buffers
+    prefill_gate_up_buffer, prefill_down_buffer = cache.stage_views(0, 0)
     assert prefill_gate_up_buffer.data_ptr() == cache.bank_caches["gate_up"].data_ptr()
     assert prefill_down_buffer.data_ptr() == cache.bank_caches["down"].data_ptr()
 
@@ -355,6 +359,8 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         got_topk_ids,
         activation,
         apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
     ):
         calls["w1"] = w1
         calls["w2"] = w2
@@ -362,7 +368,7 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
         calls["topk_ids"] = got_topk_ids.clone()
         return hidden_states
 
-    monkeypatch.setattr("freetoken.layers.moe.fused_experts_decode_impl", fake_fused_decode)
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_decode_impl", fake_fused_decode)
 
     out = layer.decode_forward(hidden_states, router_logits)
 
@@ -406,18 +412,23 @@ def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     assert cache.src_indices[:256].tolist() == list(range(256))
 
 
-def test_adjust_config_converts_moe_cache_rate_to_cache_size():
+def test_adjust_config_converts_moe_cache_rate_to_cache_size(monkeypatch):
     from types import SimpleNamespace
 
     from freetoken.distributed import DistributedInfo
     from freetoken.engine.config import EngineConfig
+    import freetoken.engine.engine as engine_module
     from freetoken.engine.engine import _adjust_config
+
+    # This test exercises the discrete-GPU offload path regardless of the host
+    # running the suite (GB10 reports cudaDevAttrIntegrated=1).
+    monkeypatch.setattr(engine_module, "_is_unified_memory_gpu", lambda index=None: False)
 
     config = EngineConfig(
         model_path="/tmp/freetoken-test-model",
         tp_info=DistributedInfo(rank=0, size=1),
         dtype=torch.float16,
-        attention_backend="fi",
+        attention_backend="triton" if torch.version.hip is not None else "fi",
         moe_cache_rate=0.3,
     )
     object.__setattr__(
@@ -431,17 +442,17 @@ def test_adjust_config_converts_moe_cache_rate_to_cache_size():
             num_moe_layers=10,
             num_experts=8,
             expert_quant="none",
-            moe_backend="auto",
+            moe_strategy="auto",
         ),
     )
 
     _adjust_config(config)
 
-    from freetoken.moe import is_offload_moe_backend
+    from freetoken.moe import is_offload_moe_strategy
 
     assert config.moe_cache_size == 24
-    # Family, not member: a box with a benchbw profile resolves bf16 experts to hybrid.
-    assert is_offload_moe_backend(config.moe_backend)
+    # Family, not member: which offload-family backend auto picks is not this test's claim.
+    assert is_offload_moe_strategy(config.moe_strategy)
 
 
 def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
@@ -464,7 +475,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
         events.append("graph_exit")
 
     class FakeAttnBackend:
-        def init_capture_graph(self, max_seq_len, bs_list):
+        def init_capture_graph(self, max_seq_len, bs_list, rows_per_req=1):
             pass
 
         def prepare_for_capture(self, batch):
@@ -486,6 +497,7 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     monkeypatch.setattr("torch.cuda.empty_cache", lambda: None)
     monkeypatch.setattr("torch.cuda.reset_peak_memory_stats", lambda device=None: None)
     monkeypatch.setattr("freetoken.engine.graph.get_free_memory", lambda device: 1024)
+    monkeypatch.setattr("freetoken.engine.graph._upload_graph", lambda graph, stream: None)
 
     dummy_req = Req(
         input_ids=torch.tensor([0], dtype=torch.int32),
@@ -499,13 +511,12 @@ def test_graph_capture_reuses_warm_offload_cache_before_capture(monkeypatch):
     GraphRunner(
         stream=None,
         device=torch.device("cpu"),
-        model=FakeModel(),
+        forward=FakeModel().forward,
         attn_backend=FakeAttnBackend(),
         cuda_graph_bs=[1],
         cuda_graph_max_bs=None,
         free_memory=1024,
         max_seq_len=1,
-        vocab_size=3,
         dummy_req=dummy_req,
         moe_offload_cache=FakeOffloadCache(),
     )
@@ -628,6 +639,184 @@ def test_offload_cache_rebuild_resizes_and_preserves_sources():
     assert torch.all(cache.id_of_slot == -1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_slot_pools_of_two_bank_layouts_keep_their_rows_through_prefill():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, top_k = 4, 8, 4
+    # layers 1 and 3 keep wider down rows (uint8, like Q6_K next to Q4_K); their pools come first
+    wide = (1, 3)
+    sources = {
+        "gate_up": [torch.randn(E, 1024, 256, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+        "down": [
+            torch.randint(0, 255, (E, 512, 768), dtype=torch.uint8).pin_memory() if layer in wide
+            else torch.randn(E, 512, 256, dtype=torch.bfloat16).pin_memory()
+            for layer in range(L)
+        ],
+    }
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=33, device=torch.device("cuda"),
+        prefill_overlap=True, prefill_hit_d2d=True, pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10],
+    )
+    cache.set_bank_sources(sources)
+    assert [v[1].dtype for v in map(cache.pool_bank_views, range(L))] == [torch.bfloat16, torch.uint8] * 2
+    # staging buffers take 2 x 8 rows of every bank: all of the wide pools, the first 8 slots of layer 0's pool
+    assert cache._pool_stable_from == [6, 5, 8, 0]
+
+    def check_resident() -> None:
+        torch.cuda.synchronize()
+        for layer in range(L):
+            for e, s in enumerate(cache.slot_for_id[layer].tolist()):
+                if s >= 0:
+                    for (src, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                        assert torch.equal(view[s].cpu(), src[layer][e]), (layer, e, s)
+
+    def decode(steps: int) -> None:
+        for _ in range(steps):
+            for layer in range(L):
+                cache.ensure_experts(layer, torch.randperm(E)[:top_k].to(torch.int32).view(1, top_k).cuda())
+                cache.copy_missing()
+        check_resident()
+
+    decode(20)
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        views = cache.wait_prefill_layer(layer)
+        torch.cuda.synchronize()
+        for (src, _), view in zip(cache.banks, views):
+            assert torch.equal(view.cpu(), src[layer])
+        cache.release_prefill_layer(layer)
+    assert cache.prefill_hit_rows > 0
+    for p, stable in enumerate(cache._pool_stable_from):
+        if stable:
+            assert not any(view[0].any() for view in cache.pool_bank_views(cache.pool_of_layer.index(p)))
+    check_resident()
+    decode(20)
+
+    cache.materialize_layer(3)
+    cache.copy_missing()
+    for (src, _), view in zip(cache.banks, cache.stage_views(3, 0)):
+        assert torch.equal(view.cpu(), src[3])
+    check_resident()
+
+    cache.rebuild(32, [5, 5, 10, 12])
+    decode(20)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_slot_pools_split_layers_of_one_bank_layout_by_quant_tag():
+    from freetoken.moe.offload_cache import OffloadMoeCache, bank_layouts
+    from freetoken.moe.pool_policy import group_layers
+
+    _init_tp()
+    L, E = 4, 8
+    # uint8 rows of one width, as GGUF Q4_K and IQ4_NL rows are
+    sources = {
+        "gate_up": [torch.randint(1, 255, (E, 64, 144), dtype=torch.uint8).pin_memory() for _ in range(L)],
+        "down": [torch.randint(1, 255, (E, 32, 144), dtype=torch.uint8).pin_memory() for _ in range(L)],
+    }
+    tags = [("ggml", "Q4_K", "Q4_K"), ("ggml", "IQ4_NL", "IQ4_NL")] * 2
+    assert group_layers("unified", bank_layouts(sources, tags), [1] * L) == [[0, 2], [1, 3]]
+
+    def make(pool_of_layer, pool_sizes):
+        return OffloadMoeCache(
+            num_layers=L, num_experts=E, cache_size=sum(pool_sizes), device=torch.device("cuda"),
+            prefill_overlap=True, pool_of_layer=pool_of_layer, pool_sizes=pool_sizes,
+        )
+
+    with pytest.raises(AssertionError, match="layouts"):
+        make([0] * L, [20]).set_bank_sources(sources, layer_tags=tags)
+    cache = make([0, 1, 0, 1], [10, 10])
+    cache.set_bank_sources(sources, layer_tags=tags)
+    assert cache.bank_caches["down"].shape == (20, 32, 144)
+    # the staging buffers cover pool 0 and slots [0, 6) of pool 1, so both slot 0 rows end up with another quant's bytes
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        cache.wait_prefill_layer(layer)
+        cache.release_prefill_layer(layer)
+    torch.cuda.synchronize()
+    for layer in (0, 1):
+        for view in cache.pool_bank_views(layer):
+            assert not view[0].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("wide", [(), (1, 3)], ids=["cpu-mode", "two-layouts"])
+def test_slot_pools_and_staging_buffers_end_in_zero_mmq_tails(wide):
+    from freetoken.layers.quantization.ggml_types import mmq_tail_bytes, row_bytes
+    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.third_party.gguf import GGMLQuantizationType
+
+    _init_tp()
+    torch.manual_seed(0)
+    L, E, top_k = 4, 8, 4
+
+    def layout(ggml_type):
+        """(rows, row bytes, tail bytes) of gate_up and down for Gemma-4 26B-A4B's K = 2816 and 704, with fewer rows."""
+        return tuple((rows, row_bytes(ggml_type, k), mmq_tail_bytes(ggml_type, k)) for rows, k in ((32, 2816), (64, 704)))
+
+    q4_0, q8_0 = layout(GGMLQuantizationType.Q4_0), layout(GGMLQuantizationType.Q8_0)
+    shapes = [q8_0 if layer in wide else q4_0 for layer in range(L)]
+    roles = ("gate_up", "down")
+    sources = {role: [torch.randint(1, 255, (E, *shapes[l][k][:2]), dtype=torch.uint8).pin_memory() for l in range(L)] for k, role in enumerate(roles)}
+    tails = {role: [shapes[l][k][2] for l in range(L)] for k, role in enumerate(roles)}
+    # cpu mode: the slots are exactly the two staging buffers
+    pools = dict(pool_of_layer=[2, 0, 3, 1], pool_sizes=[6, 5, 12, 10], prefill_hit_d2d=True) if wide else dict(pool_of_layer=[0] * L, pool_sizes=[2 * E])
+    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=sum(pools["pool_sizes"]), device=torch.device("cuda"), prefill_overlap=True, **pools)
+    cache.set_bank_sources(sources, row_tail_bytes=tails)
+    assert cache.prefill_overlap
+
+    def assert_zero_tails(layer: int, views) -> None:
+        torch.cuda.synchronize()
+        for k, ((_, bank), view) in enumerate(zip(cache.banks, views)):
+            end, tail = view.storage_offset() + view.numel(), shapes[layer][k][2]
+            assert end + tail <= bank.numel() and not bank[end : end + tail].any(), (layer, k)
+
+    for _ in range(20):
+        for layer in range(L):
+            cache.ensure_experts(layer, torch.randperm(E)[:top_k].to(torch.int32).view(1, top_k).cuda())
+            cache.copy_missing()
+    cache.begin_prefill()
+    for layer in range(L):
+        cache.prefetch_prefill_layer(layer)
+        cache.prefetch_prefill_layer(layer + 1)
+        assert_zero_tails(layer, cache.wait_prefill_layer(layer))
+        cache.release_prefill_layer(layer)
+    for layer in range(L):
+        assert_zero_tails(layer, cache.pool_bank_views(layer))
+    if wide:
+        cache.materialize_layer(0)
+        cache.copy_missing()
+        assert_zero_tails(0, cache.stage_views(0, 0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_offload_cache_rebuild_frees_the_old_slots_first():
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=32, device=torch.device("cuda"),
+        pool_of_layer=[0, 1], pool_sizes=[16, 16],
+    )
+    cache.set_bank_sources({
+        "gate_up": [torch.zeros(4, 1024, 1024, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+        "down": [torch.zeros(4, 512, 1024, dtype=torch.bfloat16).pin_memory() for _ in range(2)],
+    })
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    cache.rebuild(32, [8, 24])
+    # 96 MiB of slots: holding the old ones while allocating the new ones would double it
+    assert torch.cuda.max_memory_allocated() - before < 8 << 20
+
+
 def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():
     from freetoken.moe.offload_cache import OffloadMoeCache
 
@@ -643,7 +832,7 @@ def test_offload_cache_rebuild_disables_prefill_overlap_when_too_small():
 
     assert cache.cache_size == 5
     assert cache.prefill_overlap is False
-    assert cache.prefill_bank_buffers == []
+    assert cache._stage_views[0][1] is None  # no room for the second staging buffer
 
 
 def test_offload_cache_rebuild_keeps_overlap_at_boundary():
@@ -679,172 +868,466 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
         bf16.validate_rebuild(3)  # below the num_experts floor
 
 
-def test_set_bank_sources_accepts_file_backed_pageable_layers():
-    # --cpu-mem: spilled layers arrive as PAGEABLE residency and must be accepted (only
-    # the GPU movement paths refuse them, via is_pinned_layer -> the torch fallback).
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("target", ["gpu", "hybrid"])
+def test_slot_pools_keep_each_layer_in_its_own_slots(target):
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    cache = OffloadMoeCache(num_layers=2, num_experts=4, cache_size=6, device=torch.device("cpu"))
-    cache.set_bank_sources(
-        {"gate_up": [torch.randn(4, 32, 8)] * 2, "down": [torch.randn(4, 8, 16)] * 2},
-        layer_residency=["pinned", "pageable"],
+    torch.manual_seed(0)
+    L, E, sizes = 3, 16, [5, 7, 20]
+    # hybrid routes more experts than the smallest pool holds; GPU decode must fit them
+    top_k = 2 if target == "gpu" else 8
+    sources = {
+        "gate_up": [torch.randn(E, 64, 32, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+        "down": [torch.randn(E, 32, 32, dtype=torch.bfloat16).pin_memory() for _ in range(L)],
+    }
+
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=sum(sizes), device=torch.device("cuda"),
+        decode_target=target, hybrid_max_fetch=E, pool_of_layer=[0, 1, 2], pool_sizes=sizes,
     )
-    assert cache.is_pinned_layer(0) is True
-    assert cache.is_pinned_layer(1) is False
+    cache.set_bank_sources(sources)
+    for _ in range(50):
+        for layer in range(L):
+            experts = torch.randperm(E)[:top_k].to(torch.int32)
+            slots = experts.cuda()
+            if target == "gpu":
+                cache.ensure_experts(layer, slots)
+            else:
+                cache.ensure_experts_hybrid(layer, slots, torch.rand(top_k, device="cuda"))
+            cache.copy_missing()
+            resident = [(e, s) for e, s in zip(experts.tolist(), slots.tolist()) if s >= 0]
+            assert len({s for _, s in resident}) == len(resident)
+            for e, s in resident:
+                assert s < sizes[layer]
+                for (src, _), view in zip(cache.banks, cache.pool_bank_views(layer)):
+                    assert torch.equal(view[s].cpu(), src[layer][e])
+
+    # with several pools a whole-layer prefill stages slots [0, E) without registering them in any pool
+    cache.materialize_layer(1)
+    cache.copy_missing()
+    for (src, _), view in zip(cache.banks, cache.stage_views(1, 0)):
+        assert torch.equal(view.cpu(), src[1])
+    slot_for_id, id_of_slot = cache.slot_for_id.cpu(), cache.id_of_slot.cpu()
+    for layer in range(L):
+        for e, s in enumerate(slot_for_id[layer].tolist()):
+            if s >= 0:
+                assert cache.pool_bases[layer] + s >= E
+                assert id_of_slot[cache.pool_bases[layer] + s] == layer * E + e
+
+    cache.rebuild(40, [8, 8, 24])
+    assert [v[0].shape[0] for v in map(cache.pool_bank_views, range(L))] == [8, 8, 24]
 
 
-def test_set_bank_sources_still_rejects_locked_residency():
+def _hybrid_ensure_reference(st, layer, ids, weights, num_experts, pool, frac, mode, kernel_fetch):
+    """One hybrid ensure call on CPU copies of the cache state, written from the LRU contract."""
+    base, size = pool
+    step = int(st["step"]) + 1
+    slot_for_id, recency = st["slot_for_id"], st["expert_recency"]
+    p_ids, p_usage = st["id_of_slot"][base : base + size], st["usage"][base : base + size]
+    active = sorted(set(ids.tolist()))
+    hits = [e for e in active if slot_for_id[layer, e] >= 0]
+    missing = [e for e in active if slot_for_id[layer, e] < 0]
+    m, fq = len(missing), min(1 << 16, max(0, round(frac * (1 << 16))))
+    lo, room = (m * fq) >> 16, size - len(hits)
+    if mode == "min-wait":
+        cost_lo = max(lo * ((1 << 16) - fq), (m - lo) * fq)
+        cost_hi = max((lo + 1) * ((1 << 16) - fq), (m - lo - 1) * fq)
+        num_fetch = min(m, lo if cost_lo <= cost_hi else lo + 1, room)
+    elif mode == "prefer-fetch":
+        num_fetch = min(m, (m * fq + 0xFFFF) >> 16, room)
+    else:
+        allowed = {min(m, lo, room)} if (m * fq) & 0xFFFF == 0 else {min(m, lo, room), min(m, lo + 1, room)}
+        assert kernel_fetch in allowed
+        num_fetch = kernel_fetch
+    taken = torch.zeros(size, dtype=torch.bool)
+    for e in hits:
+        p_usage[slot_for_id[layer, e]] = step
+        taken[slot_for_id[layer, e]] = True
+    plan = []
+    for e in sorted(missing, key=lambda e: (-int(recency[layer, e]), e))[:num_fetch]:
+        victim = int(torch.argmin(p_usage.masked_fill(taken, torch.iinfo(torch.int64).max)))  # first minimum
+        old = int(p_ids[victim])
+        if old >= 0:
+            slot_for_id.view(-1)[old] = -1
+        p_ids[victim] = layer * num_experts + e
+        slot_for_id[layer, e] = victim
+        p_usage[victim] = step
+        taken[victim] = True
+        plan.append((victim, e))
+    recency[layer, active] = step
+    st["step"] = torch.tensor(step)
+    slots = slot_for_id[layer, ids.long()]
+    on_gpu = slots >= 0
+    return st, plan, slots, torch.where(on_gpu, -1, ids), torch.where(on_gpu, weights, 0.0), m, active
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("mode", ["min-wait", "stochastic", "prefer-fetch"])
+@pytest.mark.parametrize("clamp", [False, True])
+@pytest.mark.parametrize("layout", ["global", "global-tiled", "per-layer"])
+def test_hybrid_ensure_matches_lru_reference(monkeypatch, layout, clamp, mode):
+    from freetoken.moe import offload_kernels
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
-    with pytest.raises(NotImplementedError, match="LOCKED"):
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FETCH_ROUND", offload_kernels._HYBRID_FETCH_ROUNDING[mode])
+    torch.manual_seed(0)
+    # global-tiled: more slots than one Phase 2 tile, so victims come from the tiled scan
+    L, E, top_k = (20, 512, 10) if layout == "global-tiled" else (4, 128, 8)
+    size = {"global": 300, "global-tiled": offload_kernels._HYBRID_EVICT_CHUNK + 808, "per-layer": 4 * 96}[layout]
+    pools = {"pool_of_layer": list(range(L)), "pool_sizes": [96] * L} if layout == "per-layer" else {}
+    cache = OffloadMoeCache(
+        num_layers=L, num_experts=E, cache_size=size, device=torch.device("cuda"),
+        decode_target="hybrid", hybrid_max_fetch=1, **pools,
+    )
+    popularity = 1.0 / torch.arange(1, E + 1, dtype=torch.float64) ** 0.6
+    names = ["slot_for_id", "id_of_slot", "usage", "step", "expert_recency"]
+
+    # fetch every miss until every pool is full, then the benched-style fraction
+    for frac, calls in ((1.0, 4000), (0.413, 60 * L)):
+        for call in range(calls):
+            layer = call % L
+            if frac == 1.0 and bool((cache.id_of_slot >= 0).all()) and layer == 0:
+                break
+            cache.hybrid_fetch_fraction = [frac] * L
+            ids = torch.cat([torch.multinomial(popularity, top_k) for _ in range(2)]).to(torch.int32)
+            weights = torch.rand(ids.numel())
+            st = {n: getattr(cache, n).cpu().clone() for n in names}
+            p = cache.pool_of_layer[layer]
+            routes = cache.ensure_experts_hybrid(layer, ids.cuda(), weights.cuda(), clamp=clamp)
+            n = int(cache.num_indices)
+            st, plan, slots, cpu_ids, gpu_w, m, active = _hybrid_ensure_reference(
+                st, layer, ids, weights, E, (cache.pool_bases[p], cache.pool_sizes[p]), frac, mode, n
+            )
+            assert int(cache.num_missing_full) == m and n == len(plan)
+            assert cache.evict_slots[:n].cpu().tolist() == [v for v, _ in plan]
+            assert cache.src_indices[:n].cpu().tolist() == [e for _, e in plan]
+            assert torch.equal(routes.gpu_slots.cpu(), slots.clamp(min=0) if clamp else slots)
+            assert torch.equal(routes.cpu_ids.cpu(), cpu_ids) and torch.equal(routes.gpu_w.cpu(), gpu_w)
+            assert cache.active_mask.cpu().nonzero().flatten().tolist() == active
+            for name in names:
+                assert torch.equal(getattr(cache, name).cpu(), st[name]), name
+        assert bool((cache.id_of_slot >= 0).all())
+
+
+def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
+    """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    dev = torch.device(device)
+    cache = OffloadMoeCache(
+        num_layers=num_layers, num_experts=4, cache_size=8,
+        device=dev, prefill_overlap=prefill_overlap,
+    )
+    cache.cpu_layer_ids = frozenset(locked)
+    src_dev = dev if dev.type == "cuda" else torch.device("cpu")
+    sources = {
+        # CUDA-resident pinned-layer sources keep _build_copy_plan's device_ptr happy in the CUDA variant; locked layers stay host tensors (never translated)
+        "gate_up": [
+            torch.randn(4, 32, 8, device=torch.device("cpu") if i in locked else src_dev)
+            for i in range(num_layers)
+        ],
+        "down": [
+            torch.randn(4, 8, 16, device=torch.device("cpu") if i in locked else src_dev)
+            for i in range(num_layers)
+        ],
+    }
+    residency = [
+        HostResidency.LOCKED.value if i in locked else HostResidency.PINNED.value
+        for i in range(num_layers)
+    ]
+    cache.set_bank_sources(sources, layer_residency=residency)
+    return cache, sources
+
+
+def test_set_bank_sources_locked_layer_requires_cpu_layer_ids():
+    # a layer without a device address can only decode on the CPU executor; labeling it LOCKED outside cpu_layer_ids is a wiring bug and must fail loudly
+    from freetoken.moe.host_banks import HostResidency
+    from freetoken.moe.offload_cache import OffloadMoeCache
+
+    _init_tp()
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+    )
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="cpu_layer_ids"):
         cache.set_bank_sources(
-            {"gate_up": [torch.randn(4, 32, 8)], "down": [torch.randn(4, 8, 16)]},
-            layer_residency=["locked"],
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
         )
 
 
-def test_copy_missing_serves_spilled_layer_through_torch_fallback():
-    # A file-backed layer's rows have no device alias, so copy_missing must fall back to
-    # plain torch indexing (the prefill materialize path is the only caller).
+def test_set_bank_sources_locked_layer_rejects_prefill_overlap():
+    # prefill overlap DMAs from registered banks; a LOCKED layer cannot feed it
+    from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
 
     _init_tp()
-    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
-    gate_up = torch.randn(4, 32, 8)
-    down = torch.randn(4, 8, 16)
-    cache.set_bank_sources(
-        {"gate_up": [gate_up], "down": [down]}, layer_residency=["pageable"],
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=8, device=torch.device("cpu"),
+        prefill_overlap=True,
     )
+    cache.cpu_layer_ids = frozenset({1})
+    sources = {
+        "gate_up": [torch.randn(4, 32, 8) for _ in range(2)],
+        "down": [torch.randn(4, 8, 16) for _ in range(2)],
+    }
+    with pytest.raises(ValueError, match="[Pp]refill overlap"):
+        cache.set_bank_sources(
+            sources,
+            layer_residency=[HostResidency.PINNED.value, HostResidency.LOCKED.value],
+        )
 
-    # Stage a two-row miss the way ensure_experts/materialize_layer would: slots 0/1
-    # evicted, source rows 3/2.
-    cache._pending_src_layer = 0
-    cache.evict_slots[0] = 0
-    cache.evict_slots[1] = 1
-    cache.src_indices[0] = 3
-    cache.src_indices[1] = 2
-    cache.num_indices[0] = 2
 
+def test_locked_layer_prefill_materialize_copies_whole_layer_pageable():
+    # the only movement a LOCKED layer needs: copy_missing's pageable branch copies the whole layer into slots [0, E) with position == expert id
+    # stage the state materialize_layer would (its kernel is CUDA-only; the fixture cache lives on the CPU)
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,))
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = True
     cache.copy_missing()
 
-    assert torch.equal(cache.bank_caches["gate_up"][0], gate_up[3])
-    assert torch.equal(cache.bank_caches["gate_up"][1], gate_up[2])
-    assert torch.equal(cache.bank_caches["down"][0], down[3])
-    assert torch.equal(cache.bank_caches["down"][1], down[2])
-
-
-def test_set_host_expert_pool_builds_global_shared_pool():
-    # --cpu-mem-mode expert: one pool shared across ALL layers; the warm fill is
-    # round-robin (expert-major), the mapping table lives host+device, and unpinned
-    # experts read -1. Split-residency values stay accepted (HostBank primitive).
-    from freetoken.moe.offload_cache import OffloadMoeCache
-
-    _init_tp()
-    L, E, N = 2, 4, 3
-    cache = OffloadMoeCache(num_layers=L, num_experts=E, cache_size=6, device=torch.device("cpu"))
-    cache.set_bank_sources(
-        {"gate_up": [torch.randn(E, 32, 8)] * L, "down": [torch.randn(E, 8, 16)] * L},
-        layer_residency=["pageable"] * L,
-    )
-    cache.set_host_expert_pool(N)
-    assert cache.host_pool_size == N
-    assert cache.host_slot_for_id.shape == (L, E)
-    # round-robin: expert 0 of every layer, then expert 1 of layer 0
-    assert int(cache.host_slot_for_id[0, 0]) == 0
-    assert int(cache.host_slot_for_id[1, 0]) == 1
-    assert int(cache.host_slot_for_id[0, 1]) == 2
-    assert int(cache.host_slot_for_id[1, 1]) == -1
-    for name in ("gate_up", "down"):
-        assert cache.host_pool[name].shape[0] == N
-    # warm rows must equal the bank bytes they were filled from
-    assert torch.equal(cache.host_pool["gate_up"][0], cache.bank_sources["gate_up"][0][0])
-    assert torch.equal(cache.host_pool["gate_up"][2], cache.bank_sources["gate_up"][0][1])
-
-
-def test_copy_missing_unmasked_ignores_the_host_pool():
-    # Prefill (unmasked) materialization of a pooled layer must stage through torch
-    # indexing: the fused gather would dereference non-pooled rows.
-    from freetoken.moe.offload_cache import OffloadMoeCache
-
-    _init_tp()
-    cache = OffloadMoeCache(num_layers=1, num_experts=4, cache_size=6, device=torch.device("cpu"))
-    gate_up = torch.randn(4, 32, 8)
-    down = torch.randn(4, 8, 16)
-    cache.set_bank_sources({"gate_up": [gate_up], "down": [down]}, layer_residency=["pageable"])
-    cache.set_host_expert_pool(2)
-
-    cache._pending_src_layer = 0
-    cache.evict_slots[0] = 0
-    cache.src_indices[0] = 3  # an unpooled row: only the torch path may serve it
-    cache.num_indices[0] = 1
-    cache.copy_missing()  # unmasked -> pageable fallback, the pool stays out of it
-    assert torch.equal(cache.bank_caches["gate_up"][0], gate_up[3])
-    assert torch.equal(cache.bank_caches["down"][0], down[3])
+    gate_up_cache, down_cache = (c for _, c in cache.banks)
+    assert torch.equal(gate_up_cache[:4], sources["gate_up"][1])
+    assert torch.equal(down_cache[:4], sources["down"][1])
+    # (The pinned layers' staged JIT path is covered by the mocked tests above.)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_masked_copy_gathers_pooled_rows_into_the_slot_cache():
-    """End-to-end pooled decode fetch: the pool-aware hybrid ensure schedules only
-    pool-resident misses (copy rows = pool slot ids); copy_missing(masked=True)
-    fused-gathers them off the registered pool tensors and the slot cache rows match
-    the source bank bytes."""
-    from freetoken.moe.offload_cache import OffloadMoeCache
+def test_copy_plan_skips_locked_layers_and_keeps_fused_path():
+    # _build_copy_plan must not resolve a device alias for a LOCKED layer; its descriptor row stays a 0 placeholder while the pinned layers keep the fused path
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
 
-    _init_tp()
-    E, N = 16, 6
-    dev = torch.device("cuda")
-    gate_up = torch.randint(0, 256, (E, 4, 128), dtype=torch.uint8)
-    down = torch.zeros(E, 4, 128, dtype=torch.uint8)
-    cache = OffloadMoeCache(
-        num_layers=1, num_experts=E, cache_size=E, device=dev,
-        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=E,
-    )
-    cache.set_bank_sources({"gate_up": [gate_up], "down": [down]}, layer_residency=["pageable"])
-    cache.set_host_expert_pool(N)  # warm: experts 0..5 of layer 0
-    assert cache._pool_src_ptrs is not None
+    assert cache._copy_fused_ok
+    assert (cache._copy_src_ptrs[1] == 0).all(), "locked layer row must stay 0"
+    assert (cache._copy_src_ptrs[0] != 0).all(), "pinned layer rows must resolve"
 
-    ids = torch.tensor([3, 10, 5, 14, 0], dtype=torch.int32, device=dev)  # mix pooled/unpooled
-    cache.ensure_experts_hybrid(0, ids)
-    rewritten = ids.tolist()
-    assert rewritten[0] >= 0 and rewritten[2] >= 0 and rewritten[4] >= 0  # pooled: fetched
-    assert rewritten[1] == -1 and rewritten[3] == -1  # unpooled -> CPU executor
-    cache.copy_missing(masked=True)
-    torch.cuda.synchronize()
-    for i, e in enumerate([3, 10, 5, 14, 0]):
-        slot = rewritten[i]
-        if slot >= 0:
-            assert torch.equal(cache.bank_caches["gate_up"][slot].cpu(), gate_up[e])
+
+def test_locked_layer_copy_missing_rejects_ensure_experts_staging():
+    # the pageable branch presumes materialize_layer's position == expert id; staging via ensure_experts (LRU slot remap) on a locked layer must fail loudly, not gather other experts' weights
+    # stage the state ensure_experts would (its kernel is CUDA-only; the fixture cache lives on the CPU)
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,))
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = False
+    with pytest.raises(RuntimeError, match="unpinned"):
+        cache.copy_missing()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_maintain_host_pool_promotes_hot_and_demotes_cold():
-    """The between-steps re-plan: the hottest unpinned expert (by expert_recency, i.e.
-    one the CPU just computed) is promoted into the coldest pool slot; the demoted
-    mapping reads -1 and the pool bytes match the promoted expert."""
-    from freetoken.moe.offload_cache import OffloadMoeCache
+@pytest.mark.parametrize("memops", [True, False])
+def test_locked_hybrid_layer_fetches_through_staging_in_a_graph(monkeypatch, memops):
+    # a locked layer's hybrid decode fetches at most max_fetch misses per step into its slots through the pinned staging; the rest go to the CPU
+    # memops: the GPU waits on the doorbell with a stream memop, else the gather kernel spins on it
+    from types import SimpleNamespace
 
-    _init_tp()
-    E, N = 8, 2
-    dev = torch.device("cuda")
-    gate_up = torch.randint(0, 256, (E, 4, 128), dtype=torch.uint8)
-    cache = OffloadMoeCache(
-        num_layers=1, num_experts=E, cache_size=E, device=dev,
-        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=E,
-    )
-    cache.set_bank_sources(
-        {"gate_up": [gate_up], "down": [torch.zeros(E, 4, 128, dtype=torch.uint8)]},
-        layer_residency=["pageable"],
-    )
-    cache.set_host_expert_pool(N)  # warm: experts 0..1
+    from freetoken.moe.locked_fetch import LockedLayerFetch
 
-    # expert 7 was just active (CPU-computed), experts 0/1 idle -> victim = coldest
-    cache.expert_recency[0, 7] = 100
-    cache.host_usage[0] = 5  # slot 0 recently used; slot 1 (usage 0) is the coldest
-    promoted = cache.maintain_host_pool(promote_per_call=1)
-    assert promoted == 1
-    assert int(cache.host_slot_for_id[0, 7]) == 1  # promoted into the coldest slot
-    assert int(cache.host_slot_for_id[0, 1]) == -1  # demoted, no writeback needed
-    assert torch.equal(cache.host_pool["gate_up"][1], gate_up[7])
+    monkeypatch.setenv("FREETOKEN_LOCKED_FETCH_THREADS", "2")
+    torch.manual_seed(0)
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,), device="cuda")
+    cache.decode_target = "hybrid"
+    cache.locked_hybrid = frozenset({1})
+    cache.locked_fetch = LockedLayerFetch(cache, [1], plan={1: (0, 1.0)}, max_fetch=2, executor=SimpleNamespace(core_ids=[], _coord_core=-1, _flag_sync=memops))
+
+    top_k = 3
+    ids = torch.zeros(top_k, dtype=torch.int32, device="cuda")
+    weights = torch.rand(top_k, device="cuda")
+    out = {}
+
+    def step():
+        slots, _, cpu_ids = cache.ensure_experts_hybrid(1, ids, weights)
+        cache.copy_missing()
+        out["slots"], out["cpu"] = slots, cpu_ids
+
+    cache.collect_stats = True
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step()
+    torch.cuda.current_stream().wait_stream(stream)
+    cache.reset()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+
+    def replay(graph, steps):
+        resident = set()
+        for _ in range(steps):
+            experts = torch.randperm(4)[:top_k].to(torch.int32)
+            ids.copy_(experts)
+            graph.replay()
+            torch.cuda.synchronize()
+            slots, cpu_ids = out["slots"].tolist(), out["cpu"].tolist()
+            fetched = [e for e, s in zip(experts.tolist(), slots) if s >= 0 and e not in resident]
+            assert len(fetched) <= 2
+            for e, s, c in zip(experts.tolist(), slots, cpu_ids):
+                assert (s >= 0) != (c >= 0)
+                if s >= 0:
+                    for (src, _), view in zip(cache.banks, cache.pool_bank_views(1)):
+                        assert torch.equal(view[s].cpu(), src[1][e])
+            resident = {e for e, s in enumerate(cache.slot_for_id[1].tolist()) if s >= 0}
+
+    replay(graph, 12)
+    # --moe-collect-stats: the locked layer reports as its own group, and each line clears the counters
+    line = cache.decode_stats_line()
+    assert "locked 1 layer: hit" in line and "pinned" not in line, line
+    assert cache.decode_stats_line() is None
+    # a runtime rebuild reallocates evict_slots and the slot caches; the fetch follows and a new capture still copies right
+    del graph
+    cache.rebuild(12)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    replay(graph, 6)
+
+
+def test_pin_probe_pins_middle_layers_until_refused(monkeypatch):
+    # --moe-cpu-layers auto: deferred banks pin middle-out until the (simulated) quota refuses one; the rest lock, and the margin gives back the last pinned layer
+    import freetoken.kernel.pinned as pinned
+    import freetoken.moe.host_banks as hb
+
+    monkeypatch.setattr(pinned, "host_register", lambda addr, nbytes: None)
+    monkeypatch.setattr(pinned, "host_unregister", lambda addr: None)
+    monkeypatch.setattr(hb, "_os_lock", lambda addr, nbytes: None)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setattr(hb, "_sim_pinned", 0)
+    monkeypatch.setenv("FREETOKEN_SIMULATE_PIN_CAP_GB", str(3 * hb._BLK / 2**30))
+    deferred = [hb.HostResidency.DEFERRED.value] * 6
+
+    def probe(margin):
+        banks = {"gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(6)]}
+        with hb.requested_residency(deferred) as plan:
+            hb.pin_banks(banks)
+        labels = hb.probe_pin(plan, 6, margin_bytes=margin)
+        for bank in banks["gate_up"]:
+            bank.unpin()
+        return [i for i, r in enumerate(labels) if r == hb.HostResidency.LOCKED.value]
+
+    # order 2, 3, 1, 4, 0, 5: the quota takes three, layer 4 is refused
+    assert probe(0) == [0, 4, 5]
+    assert probe(hb._BLK) == [0, 1, 4, 5]
+
+
+def test_requested_residency_routes_layer_settles(monkeypatch):
+    # the ambient plan installed by load_expert_banks must route each layer's banks by label at both slow-path settle points (PinPipeline layer sink, list-valued pin_banks) and record that it was consulted
+    # without a plan everything pins
+    import freetoken.moe.host_banks as hb
+
+    settled = []
+    monkeypatch.setattr(hb.HostBank, "pin", lambda self: settled.append("pin"))
+    monkeypatch.setattr(hb.HostBank, "lock", lambda self: settled.append("lock"))
+    banks = {
+        "gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(3)],
+        "down": [hb.HostBank((4,), torch.uint8) for _ in range(3)],
+    }
+    labels = [
+        hb.HostResidency.PINNED.value,
+        hb.HostResidency.LOCKED.value,
+        hb.HostResidency.PAGEABLE.value,
+    ]
+
+    with hb.requested_residency(labels) as plan:
+        with hb.PinPipeline() as pins:
+            for layer_id in range(3):
+                pins(layer_id, {name: per[layer_id] for name, per in banks.items()})
+    # the single drain thread settles FIFO: layer 0 pins, layer 1 locks, layer 2 passes
+    assert settled == ["pin", "pin", "lock", "lock"]
+    assert plan.applied
+
+    settled.clear()
+    with hb.requested_residency(labels) as plan:
+        hb.pin_banks(banks)
+    assert settled == ["pin", "lock", "pin", "lock"]  # per name: layer 0 pin, 1 lock, 2 skip
+    assert plan.applied
+
+    settled.clear()
+    hb.pin_banks(banks)  # no ambient plan -> every layer pins
+    assert settled == ["pin"] * 6
+
+
+def test_echo_residency_stamps_honored_requests_only():
+    # load_expert_banks stamps the request onto the provider's ExpertBanks only when a settle point consulted the plan; an unconsulted plan keeps None (the engine's degrade signal)
+    from freetoken.moe.expert_banks import ExpertBanks, _echo_residency
+    from freetoken.moe.host_banks import HostResidency, _ResidencyPlan
+
+    labels = [HostResidency.PINNED.value, HostResidency.LOCKED.value]
+    banks = ExpertBanks("bf16", {"gate_up": [], "down": []})
+
+    plan = _ResidencyPlan(labels)
+    plan.residency_for(1)  # a settle point consulted the plan
+    assert _echo_residency(banks, labels, plan).layer_residency == labels
+
+    stale = _ResidencyPlan(labels)  # never consulted -> keep None + warn
+    assert _echo_residency(banks, labels, stale).layer_residency is None
+    assert _echo_residency(banks, None, None) is banks
+
+
+def test_lock_failure_downgrades_echoed_residency(monkeypatch):
+    # a failed mlock leaves the bank pageable; the plan and the echoed labels must report that instead of the requested LOCKED
+    import freetoken.moe.host_banks as hb
+    from freetoken.moe.expert_banks import ExpertBanks, _echo_residency
+
+    def boom(addr, nbytes):
+        raise OSError(12, "mlock denied")
+
+    monkeypatch.setattr(hb, "_os_lock", boom)
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")  # keep the pinned layer off CUDA
+    labels = [hb.HostResidency.PINNED.value, hb.HostResidency.LOCKED.value]
+
+    banks = {"gate_up": [hb.HostBank((4,), torch.uint8) for _ in range(2)]}
+    with hb.requested_residency(labels) as plan:
+        hb.pin_banks(banks)
+    assert plan.actual == {1: hb.HostResidency.PAGEABLE.value}
+    echoed = _echo_residency(ExpertBanks("bf16", {}), labels, plan)
+    assert echoed.layer_residency == [
+        hb.HostResidency.PINNED.value, hb.HostResidency.PAGEABLE.value,
+    ]
+
+    monkeypatch.setattr(hb, "_os_lock_failed", False)
+    with hb.requested_residency(labels) as plan2:
+        with hb.PinPipeline() as pins:
+            pins(1, {"gate_up": hb.HostBank((4,), torch.uint8)})
+    assert plan2.actual == {1: hb.HostResidency.PAGEABLE.value}
+
+
+def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch):
+    """The RAM probe must size the shards the reader will actually open, indexed subdirectory layouts included."""
+    import builtins
+    import io
+    import json
+
+    from freetoken.moe.expert_banks import _host_ram_fits_parallel
+
+    sub = tmp_path / "tensors"
+    sub.mkdir()
+    for i in (1, 2):
+        (sub / f"model-{i:05d}-of-00002.safetensors").write_bytes(b"x" * (1 << 20))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.layers.0.mlp.experts.0.gate_proj.weight": "tensors/model-00001-of-00002.safetensors",
+                    "model.layers.0.mlp.experts.0.down_proj.weight": "tensors/model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    real_open = builtins.open
+
+    def fake_open(file, *args, **kwargs):
+        if str(file) == "/proc/meminfo":
+            return io.StringIO("MemAvailable:           512 kB\n")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    assert not _host_ram_fits_parallel(str(tmp_path))

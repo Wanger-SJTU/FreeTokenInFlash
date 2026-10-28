@@ -7,9 +7,13 @@ wire with its fields intact; these pin the ones carrying state a later consumer 
 
 from __future__ import annotations
 
+import pytest
+import torch
+
 from freetoken.message import (
     BaseBackendMsg,
     DetokenizeMsg,
+    MMItem,
     BaseFrontendMsg,
     BaseTokenizerMsg,
     CacheRebuildBackendMsg,
@@ -18,9 +22,22 @@ from freetoken.message import (
     CacheRebuildResultMsg,
     PromptAdmittedMsg,
     TokenizeMsg,
+    UserMsg,
     UserReply,
 )
 from freetoken.core import SamplingParams
+
+
+def test_inline_system_policy_tokenizer_roundtrip():
+    for policy in (None, "auto", "preserve", "fold"):
+        msg = TokenizeMsg(uid=1, text=[{"role": "system", "content": "instruction"}],
+                          sampling_params=SamplingParams(), inline_system_policy=policy)
+        decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
+        assert decoded.inline_system_policy == policy
+        assert decoded.text == msg.text
+    legacy = BaseTokenizerMsg.encoder(msg)
+    legacy.pop("inline_system_policy")
+    assert BaseTokenizerMsg.decoder(legacy).inline_system_policy is None
 
 
 def test_cache_rebuild_msg_roundtrip():
@@ -89,7 +106,7 @@ def test_user_reply_token_deltas_round_trip():
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
     msg = DetokenizeMsg(
-        uid=3, next_token=42, finished=True,
+        uid=3, next_tokens=[42], finished=True,
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
@@ -122,3 +139,78 @@ def test_client_dicts_with_the_wire_tag_key_survive_intact():
         assert isinstance(out, TokenizeMsg)
         assert out.chat_template_kwargs == payload
         assert out.tools[0]["function"]["parameters"] == payload
+
+
+def test_tensor_wire_nd_and_dtype_roundtrip():
+    import numpy as np
+    import torch
+    from freetoken.message.utils import deserialize_type, serialize_type
+
+    cases = [
+        torch.arange(6, dtype=torch.int32),
+        torch.arange(12, dtype=torch.int64).reshape(3, 4),
+        torch.randn(2, 3, 5, dtype=torch.float32),
+        torch.randn(4, 1536, dtype=torch.bfloat16),
+        torch.randn(3, 4)[:, :2],  # non-contiguous input
+        torch.tensor(7, dtype=torch.int32),  # 0-d
+    ]
+    for t in cases:
+        out = deserialize_type({}, serialize_type(t))
+        assert out.dtype == t.dtype
+        assert out.shape == t.shape
+        assert torch.equal(out, t)
+
+    # legacy payloads carry no shape and decode as 1-D
+    legacy = {
+        "__type__": "Tensor",
+        "buffer": np.arange(4, dtype=np.int32).tobytes(),
+        "dtype": "torch.int32",
+    }
+    out = deserialize_type({}, legacy)
+    assert out.shape == (4,) and out.dtype == torch.int32
+
+    # 1-D payloads still omit the shape field (old decoders can read them)
+    assert "shape" not in serialize_type(torch.arange(3, dtype=torch.int32))
+
+
+def test_user_msg_with_mm_items_survives_the_wire():
+    item = MMItem(
+        modality="image",
+        hash=0x1234ABCD,
+        pad_value=1_000_000 + 0x1234ABCD,
+        offsets=[[7, 11]],
+        feature=torch.randn(16, 1536, dtype=torch.bfloat16),
+        model_specific_data={"grid_thw": [1, 4, 4]},
+    )
+    msg = UserMsg(
+        uid=9,
+        input_ids=torch.arange(16, dtype=torch.int32),
+        sampling_params=SamplingParams(),
+        mm_items=[item],
+        mrope_positions=torch.zeros(3, 16, dtype=torch.int32),
+        mrope_delta=-3,
+    )
+    out = BaseBackendMsg.decoder(msg.encoder())
+    assert isinstance(out, UserMsg)
+    got = out.mm_items[0]
+    assert (got.hash, got.pad_value, got.offsets) == (0x1234ABCD, 1_000_000 + 0x1234ABCD, [[7, 11]])
+    assert got.num_tokens == 4 and got.grid_thw == [1, 4, 4]  # model_specific_data reads as attributes
+    assert got.precomputed_embeddings is None
+    assert torch.equal(got.feature, item.feature)
+    assert out.mrope_positions.shape == (3, 16) and out.mrope_delta == -3
+
+
+def test_mm_item_shape_rules():
+    t = torch.zeros(2, 4)
+    item = MMItem(modality="image", hash=1, pad_value=1, offsets=[[3, 5], [9, 12]], feature=t)
+    item.validate()
+    assert item.num_tokens == 5
+    assert getattr(item, "grid_thw", None) is None  # missing model-specific key -> AttributeError path
+    with pytest.raises(ValueError, match="half-open"):
+        MMItem(modality="image", hash=1, pad_value=1, offsets=[[5, 5]], feature=t).validate()
+    with pytest.raises(ValueError, match="exactly one"):
+        MMItem(modality="image", hash=1, pad_value=1, offsets=[[0, 2]]).validate()
+    with pytest.raises(ValueError, match="exactly one"):
+        MMItem(
+            modality="image", hash=1, pad_value=1, offsets=[[0, 2]], feature=t, precomputed_embeddings=t
+        ).validate()

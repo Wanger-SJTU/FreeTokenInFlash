@@ -49,6 +49,7 @@ def _glm_dsa_sparse_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -57,11 +58,14 @@ def _glm_dsa_sparse_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
-    offs_r = tl.arange(0, D_R)
 
     q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
     q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-    q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+    if HAS_ROPE:
+        # NoPE checkpoints (glm5_next) have D_R == 0: tl.arange needs a non-empty
+        # span, so the whole rope half is compiled out on the constexpr.
+        offs_r = tl.arange(0, D_R)
+        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
 
     m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
@@ -79,9 +83,12 @@ def _glm_dsa_sparse_kernel(
         valid = idxs >= 0
         kv_base = pool_ptr + idxs[:, None] * stride_pn
         kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-        kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
 
-        scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+        scores = tl.dot(q_v, tl.trans(kv_v))
+        if HAS_ROPE:
+            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+            scores += tl.dot(q_r, tl.trans(kv_r))
+        scores = scores * scale
         scores = tl.where(valid[None, :], scores, -float("inf"))
 
         m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -207,6 +214,7 @@ def _glm_dsa_splitk_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
     """Stage 1 (decode flash-decoding): each program reduces one BLOCK_T-aligned slice of
@@ -221,7 +229,6 @@ def _glm_dsa_splitk_kernel(
     offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = offs_h < H
     offs_v = tl.arange(0, D_V)
-    offs_r = tl.arange(0, D_R)
 
     n_active = TOPK
     if HAS_COUNTS:
@@ -238,7 +245,9 @@ def _glm_dsa_splitk_kernel(
     if split_end > split_start:
         q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
         q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
-        q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
+        if HAS_ROPE:
+            offs_r = tl.arange(0, D_R)
+            q_r = tl.load(q_base + (D_V + offs_r[None, :]) * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
         idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
 
         for start in range(split_start, split_end, BLOCK_T):
@@ -248,9 +257,12 @@ def _glm_dsa_splitk_kernel(
             valid = idxs >= 0
             kv_base = pool_ptr + idxs[:, None] * stride_pn
             kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
-            kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
 
-            scores = (tl.dot(q_v, tl.trans(kv_v)) + tl.dot(q_r, tl.trans(kv_r))) * scale
+            scores = tl.dot(q_v, tl.trans(kv_v))
+            if HAS_ROPE:
+                kv_r = tl.load(kv_base + (D_V + offs_r[None, :]) * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
+                scores += tl.dot(q_r, tl.trans(kv_r))
+            scores = scores * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
 
             m_new = tl.maximum(m_i, tl.max(scores, axis=1))
@@ -333,13 +345,14 @@ def _split_count(b: int, m: int, h: int, topk: int, device) -> int:
 
 
 def glm_dsa_sparse_attn(
-    q: torch.Tensor,          # [b, m, h, d_v + d_r]  (ckv-absorbed | rope)
+    q: torch.Tensor,          # [b, m, h, d_v + d_r]  (ckv-absorbed | rope), any strides
     pool: torch.Tensor,       # [rows, d_v + d_r]     GLOBAL latent pool slab (this layer)
     topk_idxs: torch.Tensor,  # [b, m|1, topk] int32 global rows, -1 masked
     softmax_scale: float,
     counts: torch.Tensor | None = None,  # [b, m] int32 live columns per query (device-read)
     d_v: int = 512,
     force_splits: int | None = None,     # tests only: 0 = single-program, N = split-k N
+    out: torch.Tensor | None = None,     # [b, m, h, d_v] to write into, any strides
 ) -> torch.Tensor:
     """Sparse MLA attention over gathered latent rows; returns ``[b, m, h, d_v]``.
 
@@ -347,18 +360,29 @@ def glm_dsa_sparse_attn(
     list across all queries with STRIDE 0 -- the identity-selection dense path: every
     query reads the same position-ordered row list, causally bounded by its own
     ``counts[q] = position + 1``, with zero per-query index materialization.
+
+    ``q`` and ``out`` are consumed with their given strides (a transposed bmm output
+    works without a contiguous copy); ``out`` lets a preallocated workspace receive
+    the result instead of a fresh allocation.
     """
     b, m, h, d = q.shape
     d_r = d - d_v
     topk = topk_idxs.shape[-1]
     assert pool.shape[-1] == d, (pool.shape, d)
-    q = q.contiguous()
     pool_2d = pool.reshape(-1, d)
     assert pool_2d.stride(-1) == 1
     idx = topk_idxs.contiguous().to(torch.int32)
     broadcast_m = idx.shape[1] == 1 and m > 1
     assert broadcast_m or idx.shape[1] == m, (idx.shape, m)
-    o = q.new_empty(b, m, h, d_v)
+    if out is None:
+        o = q.new_empty(b, m, h, d_v)
+    else:
+        o = out
+        assert o.shape == (b, m, h, d_v), (o.shape, (b, m, h, d_v))
+        assert o.dtype == q.dtype and o.device == q.device, (o.dtype, o.device, q.dtype, q.device)
+    # The kernels address q and o with int32 offsets.
+    reach = max(sum((n - 1) * st for n, st in zip(t.shape, t.stride())) for t in (q, o))
+    assert reach < 2**31, f"q/o span {reach} elements, past int32 addressing; lower --max-prefill-length"
 
     has_counts = counts is not None
     if has_counts:
@@ -384,7 +408,7 @@ def glm_dsa_sparse_attn(
             stride_nb, stride_nm,
             D_V=d_v, D_R=d_r,
             BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
-            HAS_COUNTS=has_counts, NUM_SPLITS=n_splits,
+            HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0, NUM_SPLITS=n_splits,
             num_warps=4, num_stages=2,
         )
         grid2 = (m, b, h)
@@ -410,7 +434,7 @@ def glm_dsa_sparse_attn(
         stride_nb, stride_nm,
         D_V=d_v, D_R=d_r,
         BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
-        HAS_COUNTS=has_counts,
+        HAS_COUNTS=has_counts, HAS_ROPE=d_r > 0,
         num_warps=4, num_stages=2,
     )
     return o

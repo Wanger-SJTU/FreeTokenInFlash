@@ -100,7 +100,7 @@ def _pick_inner_backend(block_size: int) -> str:
 
     from freetoken.engine.engine import _resolve_auto_attention_backend
 
-    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}), False)
+    name = _resolve_auto_attention_backend(frozenset({AttnType.FULL}))
     if not _page_ok(name):
         # trtllm (the sm_100 first pick) pins 16/32/64-token pages; walk the rest
         # of the SAME tree (same arch gates, same requirement probes) with the
@@ -368,7 +368,9 @@ class M3SparseAttnBackend(BaseAttnBackend):
         return out
 
     # ----- CUDA graph (decode) ------------------------------------------------------------
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        if rows_per_req != 1:
+            raise NotImplementedError("m3_sparse captures decode graphs only")
         self.inner.init_capture_graph(max_seq_len, bs_list)
         self.capture_bs = sorted(bs_list)
         max_bs = max(bs_list)

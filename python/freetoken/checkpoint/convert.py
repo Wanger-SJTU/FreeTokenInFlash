@@ -119,9 +119,11 @@ class _ConvertSink:
     under one lock (disk-bound anyway).
     """
 
-    def __init__(self, writer: FTWWriter, desc: str = "Converting expert banks") -> None:
+    def __init__(self, writer: FTWWriter, desc: str = "Converting expert banks", *, names: dict[str, str] | None = None) -> None:
         self._writer = writer
         self._desc = desc
+        # canonical role -> the bank name the file stores
+        self._names = names or {}
         self._bar = None
         self._lock = threading.Lock()
         self._seen: set[int] = set()
@@ -139,7 +141,7 @@ class _ConvertSink:
             nbytes = 0
             for bank_name, bank in banks.items():
                 self._writer.add_tensor(
-                    layer_bank_entry_name(bank_name, layer_id), bank.tensor, kind="experts_bank"
+                    layer_bank_entry_name(self._names.get(bank_name, bank_name), layer_id), bank.tensor, kind="experts_bank"
                 )
                 nbytes += bank.nbytes
                 bank.release()
@@ -166,6 +168,7 @@ def convert_checkpoint(
     *,
     dtype: torch.dtype = torch.bfloat16,
     moe_backend: str = "offload",
+    quant_backend: str | None = None,
     shard_limit: int = DEFAULT_SHARD_LIMIT,
     device: str | None = None,
 ) -> dict:
@@ -195,10 +198,19 @@ def convert_checkpoint(
     torch.zeros(1, device=dev)  # init CUDA context (needed by nvfp4 backend pick / pinning)
 
     cfg = EngineConfig(model_path=model_path, tp_info=DistributedInfo(tp.rank, tp.size),
-                       dtype=dtype, moe_backend=moe_backend)
+                       dtype=dtype, moe_strategy=moe_backend, quant_backend=quant_backend)
     mc = cfg.model_config
-    offload = moe_backend == "offload" and getattr(mc, "is_moe", False)
+    # every MoE strategy reads the routed experts from the banks, fused included
+    offload = getattr(mc, "is_moe", False)
     include_moe_experts = not offload
+    method = layer_methods = None
+    if offload:
+        from freetoken.engine.engine import offload_expert_methods
+        from freetoken.layers import set_rope_device
+
+        set_rope_device(dev)
+        object.__setattr__(cfg, "moe_strategy", "offload")
+        method, layer_methods = offload_expert_methods(cfg)
 
     from freetoken.utils.progress import byte_bar, count_bar
 
@@ -208,27 +220,43 @@ def convert_checkpoint(
     # 1) dense weights (host tensors; load straight to CPU to avoid GPU pressure)
     _progress("dense", 0, 0)  # phase start; per-tensor cumulative bytes follow (total unknown)
     dense_bytes = 0
+    from freetoken.models.gguf.reader import gguf_config_source
+
+    # an FTW keeps only a GGUF's text metadata, so it cannot build an mmproj tower
+    include_vision = gguf_config_source(model_path) is None
     for name, tensor in count_bar(load_weight(model_path, torch.device("cpu"),
-                                              include_moe_experts=include_moe_experts),
+                                              include_moe_experts=include_moe_experts, include_vision=include_vision),
                                   "Converting dense weights"):
         writer.add_tensor(name, tensor, kind="weight")
         n_weight += 1
         dense_bytes += tensor.numel() * tensor.element_size()
         _progress("dense", dense_bytes, 0)
 
+    # files the model reads directly from the checkpoint dir, not through FTW entries (Qwen3.8-Flash-Next PLE table)
+    from freetoken.models.register import _load_attr, get_model_spec
+
+    try:
+        side_hook = _load_attr(get_model_spec(mc.architectures[0]).module, "ftw_side_files")
+    except (AttributeError, KeyError, ValueError):
+        side_hook = None
+    side_files = side_hook(model_path, out_dir) if side_hook is not None else []
+
     # 2) offload expert banks (post-repack) + alpha scales (slow path auto-picks parallel/serial)
     quant_format = None
+    layer_quant_formats = None
     num_layers = None
     if offload:
-        # Streamable formats (bf16, ds_fp4, nvfp4 on the triton backend, gpt-oss mxfp4, q4_0,
-        # qwen3_5 fp8/bf16-dequant) write each layer to its own FTW entry as it completes (via
-        # the sink) instead of materializing the whole bank set first; the non-streamable ones
-        # (nvfp4 marlin/b12x -- repack mutates the whole bank set in place after load) ignore
-        # the sink. Which happened is per-provider (e.g. nvfp4's backend pick), so it's read
-        # back from ExpertBanks.streamed, not guessed here.
-        sink = _ConvertSink(writer)
-        banks = load_expert_banks(model_path, mc, device=dev, dtype=dtype, layer_sink=sink)
+        # every method-packed format streams each layer to its own FTW entry as it completes (via the sink); the GGUF provider reports through ExpertBanks.streamed whether it engaged the sink or materialized the whole bank set first
+        from freetoken.moe.legacy_format import legacy_bank_names, legacy_format_for
+
+        names = legacy_bank_names(legacy_format_for(method.kind, method.kernel.name)) if method is not None else {}
+        sink = _ConvertSink(writer, names=names)
+        banks = load_expert_banks(
+            model_path, mc, method=method, device=dev, layer_sink=sink, layer_methods=layer_methods
+        )
         quant_format = banks.quant_format
+        layer_quant_formats = banks.layer_formats
+        assert layer_quant_formats is None or banks.streamed, "experts of several formats always stream to the sink"
         if banks.streamed:
             sink.close()
             num_layers = sink.num_layers  # however many distinct layers the sink actually saw
@@ -251,12 +279,13 @@ def convert_checkpoint(
             # has whole-tensor add_tensor, so the per-layer sources reassemble into one
             # flat tensor (a per-bank host RAM spike during conversion).
             items = []
+            names = legacy_bank_names(quant_format)
             for name, per_layer in banks.sources.items():
                 if num_layers is None:
                     num_layers = len(per_layer)
                 else:
                     assert len(per_layer) == num_layers, (name, len(per_layer), num_layers)
-                items.append((name, torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
+                items.append((names.get(name, name), torch.cat(per_layer, dim=0) if len(per_layer) > 1 else per_layer[0]))
             for an in ("gate_up_alpha", "down_alpha"):
                 if getattr(banks, an, None) is not None:
                     items.append((an, getattr(banks, an)))
@@ -291,12 +320,16 @@ def convert_checkpoint(
         # read back at load (ftw.load_ftw_banks). dtype/moe_backend were dropped: each
         # tensor already carries its own dtype, and nothing reads a model-level backend.
         "quant_format": quant_format,
+        # Experts of several formats: each MoE layer's quant_format (quant_format above is the most common). A layer only
+        # stores the banks its kernel reads; the reader gives it zero-byte placeholders for the others.
+        "layer_quant_formats": layer_quant_formats,
         # The reader takes num_layers from the model config (copied into this
         # checkpoint); recording it here too gives load_ftw_banks a cross-check that
         # the banks match the config they ship with. None for non-offload checkpoints.
         "expert_bank_num_layers": num_layers,
         "counts": {"weight": n_weight, "experts_bank": n_bank + n_alpha},
         "copied_metadata": copied,
+        "side_files": side_files,
     })
     return index
 

@@ -102,7 +102,7 @@ class StatsTracker:
 
 
 def derive_model_card(config: Any) -> dict:
-    """attn enum + moe bool + ctx from the model config."""
+    """attn enum + moe bool + ctx from the model config; input_modalities is what the API accepts right now."""
     mc = config.model_config
     if getattr(mc, "has_linear_attention", False):
         attn = "hybrid_linear"
@@ -115,29 +115,31 @@ def derive_model_card(config: Any) -> dict:
         "ctx": config.max_seq_len,
         "attn": attn,
         "moe": bool(getattr(mc, "is_moe", False)),
+        "input_modalities": ["text", *sorted(config.served_modalities)],
     }
 
 
 def _swa_page_size(config: Any) -> int:
-    """The window pool's own page unit: P (window_size) for DSV4, 1 token for radix-SWA.
-    Mirrors compute_cache_pools' swa_page_size."""
-    dsv4 = getattr(getattr(config, "model_config", None), "dsv4_args", None)
-    if dsv4 is not None:
-        return int(getattr(dsv4, "window_size", 0) or 1)
-    return 1
+    from freetoken.kvcache.cache_status import window_pool_spec
+
+    spec = window_pool_spec(config)
+    return spec.page_size if spec is not None else 1
 
 
 def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
     """Full /v1/stats doc. throughput is 0 when idle; kv/mamba/swa are null
     when their total is 0 (owned-KV / non-hybrid / non-SWA). kv and swa share one shape:
-    pages + the pool's own page_size (tokens = pages x page_size)."""
+    pages + the pool's own page_size (tokens = pages x page_size). gpus: the engine's GPU as
+    [{index, name, uuid, total_bytes}] (the primary rank's; a list so TP can extend it), []
+    until the readiness meta arrives."""
     tr: StatsTracker = state.stats
     config = state.config
     ready_at = getattr(state, "ready_at", None)
     uptime_s = max(0, int(time.monotonic() - ready_at)) if ready_at is not None else 0
+    pools = getattr(state, "cache_pools", None) or {}
     kv = (
         {"used_pages": tr.kv_used_pages, "total_pages": tr.kv_total_pages,
-         "page_size": getattr(config, "page_size", 1)}
+         "page_size": pools.get("page_size") or getattr(config, "page_size", 1)}
         if tr.kv_total_pages > 0 else None
     )
     mamba = (
@@ -158,6 +160,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "mamba": mamba,
         "swa": swa,
         "vram_bytes": tr.vram_bytes,
+        "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {
             "decode_tps": round(tr.decode_tps(), 1),
             "prefill_tps": round(tr.prefill_tps(), 1),

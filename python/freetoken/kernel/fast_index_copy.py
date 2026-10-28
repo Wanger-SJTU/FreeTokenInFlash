@@ -149,17 +149,35 @@ def _jit_fast_index_copy_multi_module(*, num_threads: int, blocks_per_bank: int)
         cuda_wrappers=[("launch", f"&MultiIndexCopyKernel<{args}>::run")],
     )
 
+def default_blocks_per_bank(device: torch.device) -> int:
+    """H2D gather grid width per bank. The link's bandwidth-delay product sets how many
+    16B loads must be in flight: PCIe (~31 GB/s) saturates at ~4K threads/bank, NVLink-C2C
+    (GH200, ~450 GB/s) needs ~32K (measured: 8x1024 -> 222, 32x1024 -> 412 GB/s)."""
+    env = os.environ.get("FREETOKEN_H2D_BLOCKS_PER_BANK")
+    if env is not None:
+        blocks_per_bank = int(
+            env
+        )
+        assert blocks_per_bank > 0, (
+            "FREETOKEN_H2D_BLOCKS_PER_BANK must be greater than 0, "
+            f"got {blocks_per_bank}"
+        )
+        return blocks_per_bank  # manual override (validate > 0)
+    if any(k in torch.cuda.get_device_name(device) for k in ("GH200", "GB200", "GB300")):
+        return 32
+    return 8
 
 def fast_index_copy_multi_jit(
     dst_ptrs: torch.Tensor,
     src_ptrs: torch.Tensor,
     feat_bytes: torch.Tensor,
     dst_indices: torch.Tensor,
-    src_indices: torch.Tensor,
+    src_indices: torch.Tensor | None,
     num_indices: torch.Tensor | None = None,
     *,
     num_threads: int = 1024,
     blocks_per_bank: int = 8,
+    wait_flag: int = 0,
 ) -> None:
     """Fused multi-bank index copy: copy the same rows for every bank in ONE launch.
 
@@ -176,13 +194,16 @@ def fast_index_copy_multi_jit(
     once by the caller (the per-bank slot-cache base addr, host-source base addr, and
     per-row byte size). Every bank's per-row byte size must be a multiple of 16, and the
     base addresses 16-byte aligned (true for contiguous torch allocations of these banks).
+
+    ``src_indices`` None copies source row i to ``dst_indices[i]``. ``wait_flag``, a GPU-visible
+    int64 address, makes every block first wait until it holds >= 1 (rows a CPU thread writes).
     """
     if _skip_fast_index_copy_enabled():
         return
     module = _jit_fast_index_copy_multi_module(
         num_threads=num_threads, blocks_per_bank=blocks_per_bank
     )
-    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices)
+    module.launch(dst_ptrs, src_ptrs, feat_bytes, dst_indices, src_indices, num_indices, wait_flag)
 
 
 def update_copy_flag_jit(sync_flag: torch.Tensor, delta: int) -> None:

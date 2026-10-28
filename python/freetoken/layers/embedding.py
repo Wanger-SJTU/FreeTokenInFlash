@@ -3,20 +3,27 @@ from __future__ import annotations
 from typing import Dict
 
 import torch
-import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.utils import div_ceil, nvtx_annotate
 
 from .base import BaseOP
+from .quantization import LayerKind, QuantConfig, quant_method_for
 
 
 class VocabParallelEmbedding(BaseOP):
+    """The vocab table, sharded over TP: its ``quant_method`` owns the table, looks rows up, and serves a tied LM head's product."""
+
+    quant_layer_kind = LayerKind.EMBEDDING
+
     def __init__(
         self,
         num_embeddings: int,
         embedding_dim: int,
         embed_scale: float | None = None,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
         tp_info = get_tp_info()
@@ -27,7 +34,12 @@ class VocabParallelEmbedding(BaseOP):
         start_idx = self.num_embeddings_tp * tp_rank
         finish_idx = min(start_idx + self.num_embeddings_tp, num_embeddings)
         self.vocab_range = (start_idx, finish_idx - start_idx)
-        self.weight = torch.empty(self.num_embeddings_tp, embedding_dim)
+        self.embedding_dim = embedding_dim
+        # the LM head subclass is a linear and builds its own method
+        self.quant_method = None
+        if self.quant_layer_kind is LayerKind.EMBEDDING:
+            self.quant_method = quant_method_for(quant_config, self, prefix)
+            self.quant_method.create_weights(self)
         # Gemma scales embeddings by sqrt(hidden_size). The scale is materialized in
         # the weight dtype (bf16) to match HF, which downcasts the scalar. The GPU
         # scalar is built lazily (model __init__ runs on the meta device) and cached
@@ -38,14 +50,7 @@ class VocabParallelEmbedding(BaseOP):
 
     @nvtx_annotate("Embedding")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel import indexing
-
-        y = indexing(
-            weights=self.weight,
-            indices=x,
-            vocab_range=self.vocab_range if self.tp_size > 1 else None,
-        )
-
+        y = self.quant_method.embed(self, x)
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
         if self._embed_scale is not None:
@@ -58,6 +63,11 @@ class VocabParallelEmbedding(BaseOP):
 
 
 class ParallelLMHead(VocabParallelEmbedding):
+    """The head is a linear layer over the vocab shard: its weights come from ``quant_method``
+    unless they are tied to the input embedding."""
+
+    quant_layer_kind = LayerKind.LINEAR
+
     def __init__(
         self,
         num_embeddings: int,
@@ -65,11 +75,26 @@ class ParallelLMHead(VocabParallelEmbedding):
         bias: bool = False,
         tie_word_embeddings: bool = False,
         tied_embedding: VocabParallelEmbedding | None = None,
+        *,
+        quant_config: QuantConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__(num_embeddings, embedding_dim)
-        self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+        self.has_bias = bias
+        self.prefix = prefix
         self.tied_embedding = tied_embedding
         assert (tied_embedding is not None) == tie_word_embeddings
+        self.in_features = embedding_dim
+        self.out_features = self.num_embeddings_tp
+        self.output_sizes = (self.num_embeddings_tp,)
+        if tied_embedding is None:
+            self.quant_method = quant_method_for(quant_config, self, prefix)
+            self.quant_method.create_weights(self)
+        self.bias = torch.empty(self.num_embeddings_tp) if bias else None
+
+    def finalize(self) -> None:
+        if self.quant_method is not None:
+            self.quant_method.finalize(self)
 
     def load_state_dict(
         self,
@@ -104,19 +129,27 @@ class ParallelLMHead(VocabParallelEmbedding):
         ctx = get_global_ctx()
         batch = ctx.batch
         bs = batch.size
+        if (features := getattr(batch, "features", None)) is not None:
+            features.final_hidden(x)
         if batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(bs)
             x = x[indices].contiguous()
             del indices
+        return self.logits(x)
 
-        module = self.tied_embedding or self
-        logits = F.linear(x, module.weight, self.bias)
+    def logits(self, x: torch.Tensor) -> torch.Tensor:
+        """Full-vocab logits of the rows of ``x``; reads no batch state."""
+        if self.tied_embedding is not None:
+            logits = self.tied_embedding.quant_method.logits(self.tied_embedding, x, self.bias)
+        else:
+            logits = self.quant_method.apply(self, x)
         if self.tp_size == 1:
             return logits
         input_shape = logits.shape
         output_tensor = self._comm.all_gather(logits)
 
-        if bs == 1:
+        # keyed on rows, not batch size: a verify batch has several rows per request
+        if input_shape[0] == 1:
             return output_tensor.view(1, -1)[:, : self.num_embeddings]
 
         output_tensor = output_tensor.view((self.tp_size,) + input_shape)

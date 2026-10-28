@@ -16,13 +16,13 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-from freetoken.layers import BaseOP
 
 from freetoken.kernel.triton.e4m3_compat import (
     e4m3_act_dtype,
     e4m3_kernel_view,
     e4m3_native_cx,
     e4m3_u8_to_f32,
+    f32_to_e4m3,
     round_e4m3,
 )
 
@@ -54,7 +54,7 @@ def _act_quant_kernel(
     s = amax / 448.0  # [BLOCK_M] fp32 per-token-group scale (e4m3 finite max = 448)
     y = tl.clamp(x / s[:, None], -448.0, 448.0)
     if e4m3_native_cx():
-        y = y.to(tl.float8e4nv)
+        y = f32_to_e4m3(y)
     else:
         y = round_e4m3(y)  # e4m3-grid values into the wrapper's bf16 buffer
     tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_k[None, :] * stride_yk, y, mask=m_mask[:, None])
@@ -271,46 +271,8 @@ def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, block: int = _B
     return (weight.to(torch.float32) * s).to(torch.bfloat16)
 
 
-# ======================================================================================
-# BaseOP linear layers (TP=1, replicated).
-# ======================================================================================
-class Fp8BlockLinear(BaseOP):
-    """Replicated block-fp8 linear: fp8-e4m3 ``weight`` ``[out, in]`` + bf16
-    ``weight_scale_inv`` ``[out//128, in//128]``. Activations are quantized dynamically;
-    the GEMM dequantizes per block, so activations keep bf16 precision."""
-
-    def __init__(self, in_features: int, out_features: int, has_bias: bool = False):
-        assert in_features % _BLOCK == 0 and out_features % _BLOCK == 0, (in_features, out_features)
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = torch.empty(out_features, in_features, dtype=FP8)
-        self.weight_scale_inv = torch.empty(
-            out_features // _BLOCK, in_features // _BLOCK, dtype=torch.bfloat16
-        )
-        self.bias = torch.empty(out_features) if has_bias else None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return block_fp8_linear(x, self.weight, self.weight_scale_inv, self.bias)
-
-
-class Fp8BlockColMerged(Fp8BlockLinear):
-    """Block-fp8 column-merged linear (drop-in for ``LinearColParallelMerged`` at TP=1).
-
-    Holds one fp8 weight that is the concatenation of several projections along the output
-    dim; the caller splits the bf16 output by ``output_sizes`` exactly as before. Each part's
-    out dim must be a multiple of 128 so the concatenated ``weight_scale_inv`` blocks align."""
-
-    def __init__(self, in_features: int, output_sizes: list[int], has_bias: bool = False):
-        for o in output_sizes:
-            assert o % _BLOCK == 0, (output_sizes, "each merged output size must be /128 for fp8")
-        self.output_sizes = list(output_sizes)
-        super().__init__(in_features, sum(output_sizes), has_bias)
-
-
 __all__ = [
     "FP8",
-    "Fp8BlockLinear",
-    "Fp8BlockColMerged",
     "block_fp8_linear",
     "block_fp8_matmul",
     "per_token_group_quant_fp8",

@@ -60,7 +60,7 @@ warn_arch_override() {
     if [[ -n "${!var:-}" ]]; then
       warn "############################################################"
       warn "$var='${!var}' is set in this shell and OVERRIDES the"
-      warn "default multi-arch list (8.6 8.9 9.0 10.0 12.0, see"
+      warn "default multi-arch list (8.0 8.6 8.9 9.0 10.0 12.0, see"
       warn "freetoken-kernel-cache/build_backend.py). The kernel-cache"
       warn "wheel will only carry SASS for the listed archs — do NOT"
       warn "release it unless the narrowing is intentional."
@@ -152,7 +152,8 @@ stamp_version() {
     local version tag
     version="$(sed -nE 's/^__version__ = "([^"+]+)".*$/\1/p' "$VERSION_FILE")"
     [[ -n "$version" ]] || die "cannot read a version from $VERSION_FILE"
-    tag="$(git -C "$ROOT" describe --exact-match --tags HEAD 2>/dev/null)" \
+    # --match: the rolling `nightly` tag can sit on the same commit as the release tag.
+    tag="$(git -C "$ROOT" describe --exact-match --tags --match 'v*' HEAD 2>/dev/null)" \
       || die "FREETOKEN_BUILD_RELEASE: HEAD is not at a tag (expected tag v$version)."
     [[ "$tag" == "v$version" ]] \
       || die "FREETOKEN_BUILD_RELEASE: HEAD tag is '$tag' but version.py says '$version' (expected tag v$version)."

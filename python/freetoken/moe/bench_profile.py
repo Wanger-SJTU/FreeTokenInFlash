@@ -1,12 +1,8 @@
-"""Torch-free reader for the ``ft bench bw`` hardware profile (``benchbw.json``).
+"""Torch-free reader for the ``ft bench bw`` hardware profile (``benchbw/<gpu-uuid>.json``).
 
-The engine consults this at MoE-backend *auto* resolution (``engine.py``) to make the
-offload-vs-hybrid choice hardware-adaptive without importing the (torch-heavy) benchmark
-itself. ``benchbw.py`` writes the profile; this module only reads it.
-
-The join key is the expert *format*: the CPU-MoE-vs-PCIe-gather bandwidth ratio the choice
-rides on is dominated by ``(format, hardware)``, not by the exact model, so a profile benched
-on one workload transfers to any model with the same expert format on the same GPU.
+The profile holds one row per MoE layer kind (``layer_kind_key``): the CPU MoE and PCIe gather
+bandwidths benched for that kind on this GPU and host. The engine reads it to set each hybrid
+layer's fetch split, without importing the (torch-heavy) benchmark. ``benchbw.py`` writes it.
 """
 
 from __future__ import annotations
@@ -18,23 +14,46 @@ from freetoken.utils import init_logger
 
 logger = init_logger(__name__)
 
-# Engine ``expert_quant`` (models/config.py) -> benchbw format key (offload_cache._BANK_SCHEMAS
-# / benchbw._offload_bank_specs). Only the offload-family formats with a CPU MoE weight path can
-# ever resolve to hybrid; anything not listed falls through unmapped and finds no profile entry
-# (-> None -> offload), which is the safe default.
-_QUANT_TO_BENCH_FORMAT = {
-    "nvfp4": "nvfp4",
-    "ds_fp4": "ds_fp4",
-    "mxfp4": "mxfp4_triton",
-    "bf16": "bf16",
-    "fp8_block": "fp8_block",
-}
+# Bump when the row key or the measurements change: rows of another version are not comparable.
+PROFILE_VERSION = 6
 
 
-def default_profile_path() -> str:
-    """``$XDG_CACHE_HOME/freetoken/benchbw.json`` (mirrors ``benchbw.default_out_path``)."""
+def _cache_dir() -> str:
     cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(cache, "freetoken", "benchbw.json")
+    return os.path.join(cache, "freetoken")
+
+
+def default_profile_path(gpu_uuid: str | None = None) -> str:
+    """``$XDG_CACHE_HOME/freetoken/benchbw/<gpu-uuid>.json``, or the legacy ``benchbw.json`` without a uuid.
+
+    One file per GPU: bandwidth differs between slots.
+    """
+    if gpu_uuid:
+        return os.path.join(_cache_dir(), "benchbw", f"{gpu_uuid}.json")
+    return os.path.join(_cache_dir(), "benchbw.json")
+
+
+def latest_profile_path() -> str | None:
+    """Newest ``benchbw/*.json``, else the legacy ``benchbw.json``, else None."""
+    per_gpu = os.path.join(_cache_dir(), "benchbw")
+    newest: tuple[float, str] | None = None
+    try:
+        for name in os.listdir(per_gpu):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(per_gpu, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if newest is None or mtime > newest[0]:
+                newest = (mtime, path)
+    except OSError:
+        pass
+    if newest is not None:
+        return newest[1]
+    legacy = default_profile_path()
+    return legacy if os.path.isfile(legacy) else None
 
 
 def _load(path: str) -> dict | None:
@@ -45,15 +64,35 @@ def _load(path: str) -> dict | None:
         return None
 
 
-def _usable_profile(gpu_name: str | None, path: str | None) -> dict | None:
+def _usable_profile(
+    gpu_name: str | None, path: str | None, gpu_uuid: str | None = None
+) -> dict | None:
     """The cached profile, or ``None`` when there is no file / it was benched on another GPU
     (bandwidths are hardware-specific, so a mismatch is ignored rather than trusted).
 
-    ``path`` overrides the profile location (else ``FREETOKEN_BENCHBW_PATH`` then the default).
+    Lookup: explicit ``path`` (else ``FREETOKEN_BENCHBW_PATH``) -> ``benchbw/<gpu_uuid>.json`` -> legacy ``benchbw.json``.
     """
-    src = path or os.environ.get("FREETOKEN_BENCHBW_PATH") or default_profile_path()
-    prof = _load(src)
+    explicit = path or os.environ.get("FREETOKEN_BENCHBW_PATH")
+    if explicit:
+        candidates = [explicit]
+    else:
+        candidates = [default_profile_path(gpu_uuid)] if gpu_uuid else []
+        candidates.append(default_profile_path())
+    prof = None
+    for src in candidates:
+        prof = _load(src)
+        if isinstance(prof, dict):
+            break
+        if os.path.exists(src):
+            # unreadable profile for this card: stay on the safe default, do not borrow the legacy file
+            return None
     if not isinstance(prof, dict):
+        return None
+    if prof.get("version") != PROFILE_VERSION:
+        logger.warning(
+            f"benchbw profile {src} has version {prof.get('version')}, this engine reads "
+            f"{PROFILE_VERSION}; ignoring it, rerun `ft bench bw`"
+        )
         return None
     prof_gpu = (prof.get("gpu") or {}).get("name")
     if gpu_name and prof_gpu and prof_gpu != gpu_name:
@@ -65,75 +104,47 @@ def _usable_profile(gpu_name: str | None, path: str | None) -> dict | None:
     return prof
 
 
-def load_backend_recommendation(
-    quant_format: str, gpu_name: str | None = None, path: str | None = None
-) -> str | None:
-    """Bench-recommended offload-family backend for ``quant_format`` on this GPU, or ``None``.
+def layer_kind_key(fmt: str, options: dict[str, int], hidden: int, inter: int, top_k: int, cpu_threads: int) -> str:
+    """Row key of one MoE layer kind, e.g. ``gguf[down_type=8,gate_up_type=8]:2816x704:top8:t12``.
 
-    Returns ``"hybrid"`` only when *every* benched workload sharing this expert format
-    recommended hybrid (CPU MoE BW > threshold x PCIe gather BW); a mixed verdict (a
-    near-threshold format) resolves conservatively to ``"offload"``. ``None`` means "no usable
-    profile" (see ``_usable_profile``) or no entry for this format. The caller keeps its own
-    default (offload) on ``None``.
-    """
-    fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
-    prof = _usable_profile(gpu_name, path)
-    if prof is None:
+    ``cpu_threads`` is the CPU executor's worker count: the per-step pool overhead makes the CPU bandwidth depend on it and on ``top_k``."""
+    opts = ",".join(f"{k}={v}" for k, v in sorted(options.items()))
+    fmt = f"{fmt}[{opts}]" if opts else fmt
+    return f"{fmt}:{hidden}x{inter}:top{top_k}:t{cpu_threads}"
+
+
+def fetch_fraction(row: dict | None) -> float | None:
+    """The hybrid fetch split of a row: of a decode step's expert misses, the fraction to fetch over PCIe so the fetch and the CPU compute finish together.
+
+    From the overlapped pair (both sides measured while running concurrently): pcie_ov / (pcie_ov + cpu_ov); without it, pcie / cpu. Clamped to 1."""
+    if not isinstance(row, dict):
         return None
-
-    # Preferred: the per-dtype tuning verdicts (`ft bench bw --dtype`), a direct format->backend
-    # map -- the axis the backend pick is meant to key on.
-    dtypes = prof.get("dtypes")
-    if isinstance(dtypes, dict) and dtypes.get(fmt) in ("hybrid", "offload"):
-        return dtypes[fmt]
-
-    # Fallback: a per-model profile (`ft bench bw --model`). Aggregate the workloads sharing this
-    # format -- unanimous hybrid -> hybrid; any offload (a near-threshold split) -> offload.
-    workloads = prof.get("workloads")
-    if not isinstance(workloads, dict):
-        return None
-    picks = [
-        entry["recommended"]
-        for wl in workloads.values()
-        if isinstance(wl, dict)
-        for entry in [(wl.get("kernels") or {}).get(fmt)]
-        if isinstance(entry, dict) and entry.get("recommended")
-    ]
-    if not picks:
-        return None
-    return "hybrid" if all(p == "hybrid" for p in picks) else "offload"
-
-
-def load_hybrid_fetch_fraction(
-    quant_format: str, gpu_name: str | None = None, path: str | None = None
-) -> float | None:
-    """Benched hybrid fetch fraction for ``quant_format``, or ``None``.
-
-    The hybrid backend's bandwidth-matched fetch split: of a decode step's expert misses,
-    fetch this fraction over PCIe and compute the rest on the CPU, so both finish together.
-    Preferred source is the *overlapped* pair (CPU MoE and PCIe gather measured while
-    running concurrently -- the real contention regime): fetched/misses = pcie_ov /
-    (pcie_ov + cpu_ov). Older profiles without it fall back to the standalone bandwidths
-    under a full-DRAM-contention assumption (cpu keeps cpu - pcie under DMA), which
-    reduces to pcie/cpu. Per-dtype entry first, then any per-model entry with this format.
-    ``None`` = no usable profile; clamped to [0, 1].
-    """
-    fmt = _QUANT_TO_BENCH_FORMAT.get(quant_format, quant_format)
-    prof = _usable_profile(gpu_name, path)
-    if prof is None:
-        return None
-    entries = [(prof.get("dtype_kernels") or {}).get(fmt)] + [
-        (wl.get("kernels") or {}).get(fmt)
-        for wl in (prof.get("workloads") or {}).values()
-        if isinstance(wl, dict)
-    ]
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        cpu_ov, pcie_ov = entry.get("cpu_moe_overlap_gbs"), entry.get("pcie_gather_overlap_gbs")
-        if cpu_ov and pcie_ov:
-            return min(1.0, pcie_ov / (pcie_ov + cpu_ov))
-        cpu, pcie = entry.get("cpu_moe_gbs"), entry.get("pcie_gather_gbs")
-        if cpu and pcie:
-            return min(1.0, pcie / cpu)
+    cpu_ov, pcie_ov = row.get("cpu_moe_overlap_gbs"), row.get("pcie_gather_overlap_gbs")
+    if cpu_ov and pcie_ov:
+        return min(1.0, pcie_ov / (pcie_ov + cpu_ov))
+    cpu, pcie = row.get("cpu_moe_gbs"), row.get("pcie_gather_gbs")
+    if cpu and pcie:
+        return min(1.0, pcie / cpu)
     return None
+
+
+def locked_fetch_fraction(row: dict | None) -> float | None:
+    """The fetch split of a locked layer of this row's kind: p / (2p + c) from the same pair as ``fetch_fraction``.
+
+    A locked fetch is a CPU memcpy into staging, then the PCIe gather; taking the memcpy rate as the CPU MoE rate c, the two steps in series run at p*c / (p + c), which against the CPU compute gives p / (2p + c)."""
+    if not isinstance(row, dict):
+        return None
+    for cpu_key, pcie_key in (("cpu_moe_overlap_gbs", "pcie_gather_overlap_gbs"), ("cpu_moe_gbs", "pcie_gather_gbs")):
+        cpu, pcie = row.get(cpu_key), row.get(pcie_key)
+        if cpu and pcie:
+            return pcie / (2 * pcie + cpu)
+    return None
+
+
+def load_layer_kinds(gpu_name: str | None = None, path: str | None = None, gpu_uuid: str | None = None) -> dict | None:
+    """The rows of the usable profile for this GPU (key -> row), or None without one."""
+    prof = _usable_profile(gpu_name, path, gpu_uuid)
+    if prof is None:
+        return None
+    rows = prof.get("layer_kinds")
+    return rows if isinstance(rows, dict) else {}

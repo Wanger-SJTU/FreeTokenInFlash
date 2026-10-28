@@ -23,7 +23,9 @@ from typing import Any
 from . import request_ring
 from freetoken.core import SamplingParams
 from freetoken.message import TokenizeMsg
+from freetoken.mm.media import collect_image_refs, fetch_image_bytes, image_reject_reason
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
+from freetoken.tokenizer.inline_system import InlineSystemError
 
 try:
     # Chat templates render through jinja2 (a transformers dependency): a TemplateError means
@@ -42,12 +44,14 @@ from .reasoning_parser import (
 )
 
 
-class GenerationError(Exception):
+class GenerationError(ValueError):
     """A request failed before producing output (surfaced via ``UserReply.error`` — e.g. a
     chat template the tokenizer cannot render, or a prompt that exceeds the KV budget). Each
     adapter turns this into its own wire-level error instead of hanging on a reply that never
     arrives. ``code`` carries the stable class (``UserReply.error_code``) when the failure has
-    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose."""
+    one, so an adapter can emit it as OpenAI's error ``code`` and clients need not parse prose.
+
+    Subclasses ValueError so every adapter's invalid-request handler maps it to a 400."""
 
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
@@ -139,6 +143,7 @@ class GenSpec:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
     parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
+    inline_system_policy: str | None = None
 
     @property
     def parse_tools(self) -> bool:
@@ -163,6 +168,9 @@ def resolve_sampling(
     ignore_eos: bool,
     model_sampling: dict[str, Any],
     stop: str | list[str] | None = None,
+    default_max_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
+    presence_penalty: float = 0.0,
+    frequency_penalty: float = 0.0,
 ) -> SamplingParams:
     """Map a protocol's sampling fields onto the engine's neutral SamplingParams,
     filling unspecified fields from the checkpoint's recommended defaults."""
@@ -179,11 +187,13 @@ def resolve_sampling(
         raise ValueError(f"max_tokens must be at least 1, got {max_tokens}")
     return SamplingParams(
         ignore_eos=ignore_eos,
-        max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+        max_tokens=default_max_tokens if max_tokens is None else max_tokens,
         temperature=pick(temperature, "temperature", 0.0),
         top_k=pick(top_k, "top_k", -1),
         top_p=pick(top_p, "top_p", 1.0),
         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
     )
 
 
@@ -230,15 +240,41 @@ def _render_message(message: dict[str, Any]) -> dict[str, Any]:
     return m
 
 
-def _flatten_text_parts(parts: list[Any]) -> str:
-    texts: list[str] = []
+def _flatten_text_parts(parts: list[Any]) -> str | list[dict[str, Any]]:
+    """Plain string for text-only parts; a template-ready part list with {"type": "image"} entries (source kept under freetoken_ref) when images are present."""
+    out: list[dict[str, Any]] = []
+    has_image = False
     for part in parts:
         ptype = part.get("type") if isinstance(part, dict) else None
         if ptype == "text":
-            texts.append((part.get("text") if isinstance(part, dict) else None) or "")
+            out.append({"type": "text", "text": part.get("text") or ""})
+        elif ptype in ("image_url", "input_image"):
+            url = part.get("image_url")
+            if isinstance(url, dict):
+                url = url.get("url")
+            url = url or part.get("url")
+            if not url:
+                raise ValueError("image content part carries no url")
+            out.append({"type": "image", "freetoken_ref": {"kind": "url", "data": url}})
+            has_image = True
+        elif ptype == "image" and isinstance(part.get("freetoken_ref"), dict):
+            out.append(part)
+            has_image = True
         else:
-            raise ValueError(f"Unsupported content part type for text-only server: {ptype}")
-    return "".join(texts)
+            raise ValueError(f"Unsupported content part type: {ptype}")
+    if not has_image:
+        return "".join(p["text"] for p in out)
+    return out
+
+
+async def _resolve_images(refs: list[dict[str, Any]], state: Any) -> list[bytes]:
+    """Gate and fetch a request's images; every failure is a GenerationError."""
+    if reason := image_reject_reason(state.config):
+        raise GenerationError(reason)
+    try:
+        return await fetch_image_bytes(refs, state.config)
+    except ValueError as exc:
+        raise GenerationError(str(exc)) from exc
 
 
 def split_tool_lists(
@@ -261,6 +297,8 @@ def split_tool_lists(
 async def submit_generation(spec: GenSpec, state: Any) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
+    refs = collect_image_refs(spec.messages)
+    images = await _resolve_images(refs, state) if refs else None
     uid = state.new_user()
     await state.send_one(
         TokenizeMsg(
@@ -269,6 +307,8 @@ async def submit_generation(spec: GenSpec, state: Any) -> int:
             sampling_params=spec.sampling_params,
             chat_template_kwargs=spec.chat_template_kwargs,
             tools=spec.template_tools,
+            images=images,
+            inline_system_policy=spec.inline_system_policy,
         )
     )
     return uid
@@ -279,6 +319,8 @@ async def count_prompt_tokens(
     tools: list[dict[str, Any]] | None,
     chat_template_kwargs: dict[str, Any],
     state: Any,
+    *,
+    inline_system_policy: str | None = None,
 ) -> int:
     """Token count of an already-converted (messages, tools, chat_template_kwargs) prompt,
     using the frontend's own tokenizer (``state.frontend_tokenizer()``) so the count equals the
@@ -292,19 +334,25 @@ async def count_prompt_tokens(
     class the generation path maps to a 400. A tokenizer *initialization* failure (missing
     template, load error) propagates as its original exception, a server fault. Load + tokenize
     run in a worker thread so the event loop is never blocked."""
+    refs = collect_image_refs(messages)
+    images = await _resolve_images(refs, state) if refs else None
     msg = TokenizeMsg(
         uid=0,
         text=messages,
         sampling_params=SamplingParams(),
         chat_template_kwargs=chat_template_kwargs,
         tools=tools,
+        images=images,
+        inline_system_policy=inline_system_policy,
     )
     manager = await asyncio.to_thread(state.frontend_tokenizer)  # init failure -> server fault
     try:
-        input_ids = (await asyncio.to_thread(manager.tokenize, [msg]))[0]
+        (user_msg,) = await asyncio.to_thread(manager.tokenize, [msg])
+    except InlineSystemError as exc:
+        raise GenerationError(str(exc)) from exc
     except _TemplateError as exc:
         raise GenerationError(str(exc)) from exc
-    return int(input_ids.numel())
+    return int(user_msg.input_ids.numel())
 
 
 async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
@@ -325,6 +373,7 @@ async def prerender_error(spec: GenSpec, state: Any) -> GenerationError | None:
         sampling_params=SamplingParams(),
         chat_template_kwargs=spec.chat_template_kwargs,
         tools=spec.template_tools,
+        inline_system_policy=spec.inline_system_policy,
     )
     try:
         manager = await asyncio.to_thread(build)
@@ -361,6 +410,9 @@ def _make_reasoning_parser(spec: GenSpec, state: Any) -> ReasoningParser | None:
             or bool(ctk.get("enable_thinking"))
             or bool(ctk.get("thinking"))
         )
+    elif parser_name == "flint":
+        # Flint opens its own optional think block, including when tools are present.
+        force_reasoning = False
     elif parser_name == "minimax_m3":
         # M3's template pre-opens <mm:think> only in thinking_mode "enabled" (the
         # model then emits just the closing tag); "adaptive" (default) leaves the

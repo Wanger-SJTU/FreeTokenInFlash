@@ -5,19 +5,19 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from torch import nn
 
 from freetoken.core import get_global_ctx
 from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace
 from freetoken.kernel.triton.dsv4.norm import rms_norm
+from freetoken.layers import BaseOP, LinearColParallelMerged, LinearReplicated, LinearRowParallel, RMSNorm
 
 from .args import DeepseekV4Args
 from .compress import Compressor, Indexer
-from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
+from .layers import get_compress_topk_idxs, get_window_topk_idxs
 from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
 
 
-class Attention(nn.Module):
+class Attention(BaseOP):
     """Multi-head Latent Attention with sliding window + optional KV compression.
 
     KV lives in the paged DSV4 pools (window / compressed / indexer), resolved per token via
@@ -26,8 +26,7 @@ class Attention(nn.Module):
     ``window_pool[L]`` / ``cmp_pool[L]`` inside the kernel -- no per-forward staging slab. Both
     prefill and decode use the same paged kernel."""
 
-    def __init__(self, layer_id: int, args: DeepseekV4Args):
-        super().__init__()
+    def __init__(self, layer_id: int, args: DeepseekV4Args, *, quant_config=None, prefix: str = ""):
         self.layer_id = layer_id
         self.dim = args.dim
         self.n_heads = args.n_heads
@@ -39,23 +38,25 @@ class Attention(nn.Module):
         self.window_size = args.window_size
         self.compress_ratio = args.compress_ratios[layer_id]
         self.eps = args.norm_eps
+        self.max_image_tokens = args.vision_max_n_token
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_heads, dtype=torch.float32), requires_grad=False)
-        self.wq_a = Linear(self.dim, self.q_lora_rank, kind="fp8")
+        self.attn_sink = torch.empty(self.n_heads, dtype=torch.float32)
+        # the latent projections are replicated; wq_b shards over heads, wo_b over the output groups
+        self.wq_a = LinearReplicated(self.dim, self.q_lora_rank, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_a")
         self.q_norm = RMSNorm(self.q_lora_rank, self.eps)
-        self.wq_b = Linear(self.q_lora_rank, self.n_heads * self.head_dim, kind="fp8")
-        self.wkv = Linear(self.dim, self.head_dim, kind="fp8")
+        self.wq_b = LinearColParallelMerged(self.q_lora_rank, [self.n_heads * self.head_dim], has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wq_b")
+        self.wkv = LinearReplicated(self.dim, self.head_dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wkv")
         self.kv_norm = RMSNorm(self.head_dim, self.eps)
-        # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
+        # wo_a is one [o_lora_rank, K] matrix per output group, stacked on N and applied as a bmm; the reference dequantizes it to bf16 and so does the reader. Under TP it shards on N by group like wo_b shards on K.
         wo_a_rows = self.n_groups * args.o_lora_rank
         wo_a_k = self.n_heads * self.head_dim // self.n_groups
-        self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
-        self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
+        self.wo_a = torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16)
+        self.wo_b = LinearRowParallel(self.n_groups * args.o_lora_rank, self.dim, has_bias=False, quant_config=quant_config, prefix=f"{prefix}.wo_b")
         self.softmax_scale = self.head_dim ** -0.5
 
         if self.compress_ratio:
-            self.compressor = Compressor(args, self.compress_ratio, self.head_dim)
-            self.indexer = Indexer(args, self.compress_ratio) if self.compress_ratio == 4 else None
+            self.compressor = Compressor(args, self.compress_ratio, self.head_dim, quant_config=quant_config, prefix=f"{prefix}.compressor")
+            self.indexer = Indexer(args, self.compress_ratio, quant_config=quant_config, prefix=f"{prefix}.indexer") if self.compress_ratio == 4 else None
         else:
             self.compressor = None
             self.indexer = None
@@ -69,7 +70,7 @@ class Attention(nn.Module):
             rope_theta, args.rope_factor, args.beta_fast, args.beta_slow,
         )
         # Bound on first forward (freqs/arange only; pool buffers are read off the LIVE pool).
-        self.freqs_cis: torch.Tensor | None = None
+        self._freqs_cis: torch.Tensor | None = None
 
     # KV addressing lives in the attention backend (ctx.attn_backend), pool buffers on the live
     # pool (ctx.kv_cache) -- both read per access, so the model holds NO state a runtime rebuild
@@ -85,11 +86,11 @@ class Attention(nn.Module):
         L = self.layer_id
         win = self.window_size
         self.P = pool.P
-        self.freqs_cis = get_freqs_cis(*self._freqs_params, device)
+        self._freqs_cis = get_freqs_cis(*self._freqs_params, device)
         if self.compress_ratio:
-            self.compressor.bind_paged(pool, L, self.freqs_cis, device, tier="attn")
+            self.compressor.bind_paged(pool, L, self._freqs_cis, device, tier="attn")
             if self.indexer is not None:
-                self.indexer.bind_paged(pool, L, self.freqs_cis, device)
+                self.indexer.bind_paged(pool, L, self._freqs_cis, device)
 
     def reset(self) -> None:
         if self.compressor is not None:
@@ -102,9 +103,55 @@ class Attention(nn.Module):
         o = o.reshape(bsz, seqlen, self.n_groups, -1)
         wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
-        return self.wo_b(o)
+        return self.wo_b.forward(o)
 
-    def _prefill_segment(self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int):
+    @staticmethod
+    def visible_window_cols(
+        spans, start_pos: int, n: int, win: int, max_img: int, device: torch.device,
+        addr_lo: int = 0, width: int | None = None,
+    ) -> torch.Tensor:
+        """Window candidate columns (``-1`` padded) for a segment containing image spans.
+
+        Port of the reference ``get_image_visible`` + ``get_window_topk_idxs_visible``
+        pair: span tokens see their whole span bidirectionally (capped at ``max_img``)
+        instead of the 128-window, while text tokens -- and span tokens near the span
+        start -- keep the ordinary window into history. Returns ``[n, width]`` in
+        request-absolute coordinates with live entries in ``[addr_lo, span_end)``; the
+        caller translates to slot-lut indices (cold: as-is; extend: minus ``w_lo``).
+        """
+        if width is None:
+            width = win + max_img
+        left, right = Attention._span_left_right(spans, start_pos, n, max_img, device)
+        idx = start_pos + torch.arange(n, device=device)
+        left_add = (left - (win - 1)).clamp(min=0)
+        starts = (idx - (win - 1) - left_add).clamp(min=addr_lo)
+        cols = starts.unsqueeze(1) + torch.arange(width, device=device)
+        return torch.where(cols > (idx + right).unsqueeze(1), -1, cols)
+
+    @staticmethod
+    def _span_left_right(
+        spans, start_pos: int, n: int, max_img: int, device: torch.device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-token visible counts to the left/right within each image span.
+
+        Metadata twin of the reference ``get_image_visible`` (which derives spans from
+        virtual token ids): ``left[q] = q - span_start`` clamped to ``max_img - 1``,
+        ``right[q] = span_end - q`` clamped to ``max_img``, zero outside spans. ``spans``
+        are request-absolute positions inside ``[start_pos, start_pos + n)``.
+        """
+        left = torch.zeros(n, dtype=torch.int64, device=device)
+        right = torch.zeros(n, dtype=torch.int64, device=device)
+        for s, e in spans:
+            lo, hi = s - start_pos, e - start_pos
+            idx = torch.arange(lo, hi, device=device)
+            left[lo:hi] = (idx - lo).clamp(max=max_img - 1)
+            # the END sentinel sits at e-1: visibility reaches the END TOKEN, not past it
+            right[lo:hi] = ((hi - 1) - idx).clamp(max=max_img)
+        return left, right
+
+    def _prefill_segment(
+        self, x_seg, qr_seg, kv_seg, ti: int, start_pos: int, n: int, spans=None
+    ):
         """One request's prefill work inside a (possibly ragged) batch: persist its window KV,
         advance its compressor/indexer carry, and return its per-query candidate lists.
 
@@ -113,6 +160,16 @@ class Attention(nn.Module):
         ``(win_global [1, n, w], cmp_global [1, n, c] | None)`` at natural widths (cold: w =
         min(n, win); extend: w = win); the caller pads BOTH halves to the batch-uniform widths
         and concatenates.
+
+        ``spans`` (VL requests) are the request's image-block ranges ``[(start, end)]`` inside
+        ``[start_pos, start_pos + n)``. Vision checkpoints set ``bidirectional_mm_blocks`` on the
+        attention group, which makes prefill end a chunk before a block instead of splitting it;
+        only a block longer than one chunk budget is still cut. Inside a span, every token
+        sees the whole span (bidirectional, capped at ``vision_max_n_token``) instead of only its
+        128-window, matching the reference's ``get_window_topk_idxs_visible``. All span-visible
+        candidates are intra-segment, so the live full-page map covers them (the 128-slot ring
+        never needs to serve >128-back reads). ``spans=None`` keeps the historical path
+        bit-identical.
         """
         win, ratio, device = self.window_size, self.compress_ratio, x_seg.device
         end = start_pos + n
@@ -120,23 +177,38 @@ class Attention(nn.Module):
         self.attn.store_window(kv_seg, self.layer_id, slots)
 
         if start_pos == 0:
-            win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
-            # natural width min(n, win); the caller pads to the batch-uniform width
+            if spans:
+                max_img = self.max_image_tokens
+                cols = Attention.visible_window_cols(
+                    spans, 0, n, win, max_img, device, addr_lo=0,
+                    width=min(n, win + max_img),
+                )
+                win_cols = cols.unsqueeze(0)
+            else:
+                win_cols = get_window_topk_idxs(win, 1, n, 0).to(device)
+            # natural width min(n, win) -- win+max_img for span segments; the caller pads
             win_global = self.attn.win_cols_to_global(win_cols, slots)
         else:
             # Candidates span [w_lo, end): each new query's 128-sliding window over the retained
             # prefix plus the new tokens, causal-masked to -1 past its own position.
             w_lo = max(0, start_pos - win + 1)
             ws_pool = self.attn.window_slots_of(ti, w_lo, end)
-            abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
-            cand = (abs_p - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
-            win_cols = torch.where(cand > abs_p, -1, cand - w_lo).unsqueeze(0)
+            if spans:
+                max_img = self.max_image_tokens
+                cols = Attention.visible_window_cols(
+                    spans, start_pos, n, win, max_img, device, addr_lo=w_lo,
+                )
+                win_cols = torch.where(cols < 0, cols, cols - w_lo).unsqueeze(0)
+            else:
+                abs_p = start_pos + torch.arange(n, device=device).unsqueeze(1)
+                cand = (abs_p - win + 1).clamp(min=w_lo) + torch.arange(win, device=device)
+                win_cols = torch.where(cand > abs_p, -1, cand - w_lo).unsqueeze(0)
             win_global = self.attn.win_cols_to_global(win_cols, ws_pool)
 
         if not ratio:
             return win_global, None
-        # Only the compressor/indexer read the matched tail page's slot; resolving it costs a
-        # host sync (.item()), so do it after the ratio-0 early-out.
+        # Only the compressor/indexer read the matched tail page's slot; resolving it costs
+        # a host sync (.item()), so do it after the ratio-0 early-out.
         tail_ws = (
             int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
             if start_pos > 0 else None
@@ -144,20 +216,20 @@ class Attention(nn.Module):
         if start_pos == 0:
             self.reset()  # re-seed the compressor/indexer carry from scratch
             blocks = (
-                self.indexer(x_seg, qr_seg, 0, 0, slots, ti) if self.indexer is not None
+                self.indexer.forward(x_seg, qr_seg, 0, 0, slots, ti) if self.indexer is not None
                 else get_compress_topk_idxs(ratio, 1, n, 0, 0).to(device)
             )
-            self.compressor(x_seg, 0, slots, ti=ti)
+            self.compressor.forward(x_seg, 0, slots, ti=ti)
         else:
             blocks = (
                 self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti)
                 if self.indexer is not None
                 else self._compress_topk_extend(n, start_pos, end, 0, device, 1)
             )
-            self.compressor(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
+            self.compressor.forward(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
         return win_global, self.attn.blocks_to_global(blocks, ratio, ti=ti)
 
-    def forward_ragged(self, x, segments, flat_positions):
+    def forward_ragged(self, x, segments, flat_positions, spans_by_ti=None):
         """Ragged batched prefill (cu_seqlens). ``x`` is [1, T, dim] -- the requests' NEW token
         streams concatenated (NO padding); ``segments`` is [(offset, n, table_idx, start_pos)]
         tiling [0, T); ``flat_positions`` [T] is each token's ABSOLUTE position, so a radix-hit
@@ -178,17 +250,17 @@ class Attention(nn.Module):
         _, T, _ = x.size()
         if len(segments) == 1:
             # single contiguous segment: a free slice view instead of a per-layer gather
-            freqs = self.freqs_cis[segments[0][3]:segments[0][3] + T]
+            freqs = self._freqs_cis[segments[0][3]:segments[0][3] + T]
         else:
-            freqs = self.freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
+            freqs = self._freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
 
-        qr = q = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        qr = q = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb(q[..., -rd:], freqs)
 
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
+        kv = self.wkv.forward(x)
+        kv = self.kv_norm.forward(kv)
         apply_rotary_emb(kv[..., -rd:], freqs)
         act_quant_fp8_inplace(kv[..., :-rd], 64)
 
@@ -197,9 +269,18 @@ class Attention(nn.Module):
         win_parts: list[torch.Tensor] = []
         cmp_parts: list[torch.Tensor | None] = []
         max_c = 0
+        any_spans = False
         for off, n, ti, start_pos in segments:
+            spans = None
+            if spans_by_ti is not None:
+                req_spans = spans_by_ti.get(ti)
+                if req_spans:
+                    end = start_pos + n
+                    spans = [(s, e) for (s, e) in req_spans if s >= start_pos and e <= end]
+                    any_spans = any_spans or bool(spans)
             win_global, cmp_global = self._prefill_segment(
-                x[:, off:off + n], qr[:, off:off + n], kv[0, off:off + n], ti, start_pos, n
+                x[:, off:off + n], qr[:, off:off + n], kv[0, off:off + n], ti, start_pos, n,
+                spans=spans,
             )
             win_parts.append(win_global)
             cmp_parts.append(cmp_global)
@@ -213,6 +294,11 @@ class Attention(nn.Module):
         # is enough to flip a greedy near-tie. bs>1 pads every part to win (the historical
         # batched behavior).
         n_window = win if len(segments) > 1 else win_parts[0].shape[-1]
+        if any_spans:
+            # Span segments carry win+max_img-wide candidates; pad every part to the widest
+            # so the single flat launch stays rectangular. Text-only batches (any_spans
+            # False) keep the historical widths bit-identically.
+            n_window = max(n_window, *(w.shape[-1] for w in win_parts))
         flat = []
         for i, (off, n, ti, _start) in enumerate(segments):
             wg = win_parts[i]
@@ -273,15 +359,15 @@ class Attention(nn.Module):
         if wctx is None:
             wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
         window_slots, prev_window_slots, window_slots_topk = wctx
-        freqs_t = self.freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
+        freqs_t = self._freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
 
-        qr = q = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+        qr = q = self.q_norm.forward(self.wq_a.forward(x))
+        q = self.wq_b.forward(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = rms_norm(q, None, self.eps)
         apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
 
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
+        kv = self.wkv.forward(x)
+        kv = self.kv_norm.forward(kv)
         apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
         act_quant_fp8_inplace(kv[..., :-rd], 64)
         # Persistent window write: each row's new token to its own window slot (swa_ratio=1).

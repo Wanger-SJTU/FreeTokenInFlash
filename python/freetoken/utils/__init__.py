@@ -1,5 +1,7 @@
 from .arch import (
     is_arch_supported,
+    is_rocm,
+    get_rocm_gfx_arch,
     is_sm90_family,
     is_sm90_supported,
     is_sm100_family,
@@ -10,6 +12,7 @@ from .hf import (
     download_hf_weight,
     load_eos_token_ids,
     load_generation_sampling,
+    load_image_processor,
     load_tokenizer,
     load_toolcall_anchor_id,
 )
@@ -35,6 +38,8 @@ __all__ = [
     "load_toolcall_anchor_id",
     "init_logger",
     "is_arch_supported",
+    "is_rocm",
+    "get_rocm_gfx_arch",
     "is_sm90_family",
     "is_sm90_supported",
     "is_sm100_family",

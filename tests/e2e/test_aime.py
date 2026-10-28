@@ -18,6 +18,10 @@ Env knobs:
   FREETOKEN_AIME_SAMPLES        pass@N sample count when sampling (default 3)
   FREETOKEN_AIME_MIN_FREE_GIB   free-GPU-memory gate (default 70; raise for a big resident model)
   FREETOKEN_TEST_MOE_CACHE_SIZE >0 switches to the offload MoE backend (fp8/GLM/MiniMax)
+  FREETOKEN_TEST_MOE_BACKEND    offload-family backend override (default offload; e.g. hybrid)
+  FREETOKEN_TEST_MOE_CPU_THREADS  CPU MoE worker threads (0 = physical cores)
+  FREETOKEN_TEST_MOE_CACHE_AUTO 1 sizes the MoE cache from free VRAM instead of MOE_CACHE_SIZE
+  FREETOKEN_TEST_KV_RESERVE     KV token floor reserved before auto-cache fills experts
   FREETOKEN_TEST_MEM_RATIO      offload memory ratio (default 0.9)
 
 fp8 / offload recipe: point FREETOKEN_TEST_MODEL at the fp8 checkpoint dir and set
@@ -30,6 +34,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -150,6 +155,16 @@ def recommended_sampling(model_dir: Path) -> tuple[SamplingParams, int]:
     return sp, n_samples
 
 
+def format_chat(tokenizer, messages: list[dict]) -> str:
+    """The thinking-mode prompt: the checkpoint's chat template, or DeepSeek-V4's encoder module."""
+    from freetoken.tokenizer.tokenize import _apply_dsv4_chat_encoder, _load_dsv4_encoder_if_needed
+
+    encoder = _load_dsv4_encoder_if_needed(tokenizer)
+    if encoder is not None:
+        return _apply_dsv4_chat_encoder(encoder, messages, None, {"enable_thinking": True})
+    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=True)
+
+
 def build_llm(model_path: Path) -> LLM:
     """Resident by default; set FREETOKEN_TEST_MOE_CACHE_SIZE>0 to run an offload model
     (fp8 Qwen3.5-MoE, GLM-4.7, MiniMax, ... -- routed experts that do not fit in HBM)."""
@@ -163,11 +178,18 @@ def build_llm(model_path: Path) -> LLM:
         max_running_req=1,
         max_extend_tokens=8192,
     )
+    if quant_backend := os.environ.get("FREETOKEN_TEST_QUANT_BACKEND"):
+        kwargs["quant_backend"] = quant_backend  # --quant-backend syntax, e.g. moe.nvfp4=b12x
     cache_size = int(os.environ.get("FREETOKEN_TEST_MOE_CACHE_SIZE", "0"))
-    if cache_size > 0:
+    cache_auto = os.environ.get("FREETOKEN_TEST_MOE_CACHE_AUTO") == "1"
+    if cache_size > 0 or cache_auto:
         kwargs.update(
-            moe_backend="offload",
+            moe_strategy=os.environ.get("FREETOKEN_TEST_MOE_STRATEGY", "offload"),
+            moe_cpu_threads=int(os.environ.get("FREETOKEN_TEST_MOE_CPU_THREADS", "0")),
+            moe_cpu_layers=os.environ.get("FREETOKEN_TEST_MOE_CPU_LAYERS"),
+            moe_cache_auto=cache_auto,
             moe_cache_size=cache_size,
+            kv_reserve_tokens=int(os.environ.get("FREETOKEN_TEST_KV_RESERVE", "8192")),
             moe_cache_policy="lru",
             memory_ratio=float(os.environ.get("FREETOKEN_TEST_MEM_RATIO", "0.9")),
             max_seq_len_override=max_tokens() + 2048,
@@ -176,31 +198,14 @@ def build_llm(model_path: Path) -> LLM:
     return LLM(**kwargs)
 
 
-def visible_gpu_index() -> int:
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not visible:
-        return 0
-    first = visible.split(",", 1)[0].strip()
-    return int(first)
-
-
 def free_gpu_memory_gib() -> float:
+    # A child respects UUID visibility and CUDA_DEVICE_ORDER without initializing
+    # the engine's parent process, on both CUDA and ROCm.
     result = subprocess.run(
-        [
-            "nvidia-smi",
-            "--query-gpu=index,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        check=True,
-        text=True,
-        capture_output=True,
+        [sys.executable, "-c", "import torch; print(torch.cuda.mem_get_info(0)[0])"],
+        check=True, text=True, capture_output=True,
     )
-    target = visible_gpu_index()
-    for line in result.stdout.splitlines():
-        index, free_mib = [part.strip() for part in line.split(",", 1)]
-        if int(index) == target:
-            return int(free_mib) / 1024
-    raise RuntimeError(f"GPU {target} is not visible in nvidia-smi")
+    return int(result.stdout.strip()) / (1 << 30)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="AIME e2e needs CUDA")
@@ -243,13 +248,7 @@ def test_aime():
     for idx in selected:
         row = rows[idx]
         prompt, expected = row["prompt"], str(row["answer"])
-        messages = [{"role": "user", "content": prompt}]
-        formatted_prompt = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        formatted_prompt = format_chat(tokenizer, [{"role": "user", "content": prompt}])
         # Decode at the model's recommended params and check pass@N: the expected answer must
         # appear in at least one of N samples (single greedy/sampled runs are brittle -- see
         # recommended_sampling docstring).

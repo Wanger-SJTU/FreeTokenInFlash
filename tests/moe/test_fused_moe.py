@@ -274,3 +274,147 @@ def test_fused_experts_decode_activation_and_router_weight_modes(
     torch.cuda.synchronize()
 
     torch.testing.assert_close(output, expected, rtol=5e-2, atol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_topk_handles_non_power_of_2_k():
+    """A top-10 router (qwen4_exp) must route like any other k."""
+    from freetoken.moe.fused import _torch_fused_topk, fused_topk
+
+    gating = torch.randn(5, 64, device="cuda")
+    hidden = torch.randn(5, 8, device="cuda")
+    weights, ids = fused_topk(hidden, gating, 10, renormalize=True)
+    ref_w, ref_i = _torch_fused_topk(gating, 10, True, None)
+    assert torch.equal(ids, ref_i)
+    torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)
+
+
+# The in-repo triton router behind fused_topk; fp32 logits keep the reference top-k tie-free.
+# Ties get their own case below, because torch.topk does not break them by expert id.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("renormalize", [True, False])
+@pytest.mark.parametrize(
+    "num_tokens,num_experts,topk",
+    [(1, 512, 10), (7, 512, 10), (129, 512, 10), (33, 512, 6), (4, 64, 3)],
+)
+def test_fused_topk_softmax_matches_torch_reference(num_tokens, num_experts, topk, renormalize):
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
+    from freetoken.moe.fused import _torch_fused_topk
+
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens * 31 + topk)
+    gating = torch.randn(num_tokens, num_experts, generator=gen, device="cuda")
+
+    weights, ids = fused_topk_softmax(gating, topk, renormalize)
+    ref_w, ref_i = _torch_fused_topk(gating, topk, renormalize, None)
+
+    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
+    assert torch.equal(ids, ref_i)
+    torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_topk_softmax_ties_pick_the_lowest_expert_id():
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+    gating = torch.full((2, 8), -10.0, device="cuda")
+    gating[0, [6, 2, 5]] = 1.0  # three-way tie for two slots
+    gating[1] = 0.0  # whole row tied
+
+    weights, ids = fused_topk_softmax(gating, 3, renormalize=True)
+
+    assert ids[0].tolist() == [2, 5, 6]
+    assert ids[1].tolist() == [0, 1, 2]
+    torch.testing.assert_close(weights, torch.full((2, 3), 1.0 / 3.0, device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("limit_dtype", [torch.int32, torch.int64])
+def test_fused_topk_softmax_masks_padded_rows(limit_dtype):
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
+    from freetoken.moe.fused import _torch_fused_topk
+
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    gating = torch.randn(16, 512, generator=gen, device="cuda")
+    limit = torch.tensor(5, dtype=limit_dtype, device="cuda")
+
+    weights, ids = fused_topk_softmax(gating, 10, True, limit)
+    ref_w, ref_i = _torch_fused_topk(gating, 10, True, limit)
+
+    assert (ids[5:] == -1).all()
+    assert torch.equal(ids, ref_i)
+    torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_topk_softmax_is_cuda_graph_capturable():
+    """The padded-row limit must come off the device tensor, not a host read baked into the graph."""
+    from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    gating = torch.randn(8, 512, generator=gen, device="cuda")
+    limit = torch.tensor(8, dtype=torch.int32, device="cuda")
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fused_topk_softmax(gating, 10, True, limit)
+    torch.cuda.current_stream().wait_stream(stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _, ids = fused_topk_softmax(gating, 10, True, limit)
+
+    limit.fill_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert (ids[:3] != -1).all()
+    assert (ids[3:] == -1).all()
+
+
+def _reference_sigmoid_topk(logits, bias, topk, renormalize, scale, n_group, topk_group, num_token_non_padded):
+    """The torch routing of the GLM / MiniMax MoE blocks: sigmoid, bias for selection only, optional group-limited top-k."""
+    scores = logits.float().sigmoid()
+    choice = scores + bias.float()
+    if n_group > 1:
+        m, e = choice.shape
+        group_scores = choice.view(m, n_group, e // n_group).topk(2, dim=-1)[0].sum(dim=-1)
+        group_idx = torch.topk(group_scores, topk_group, dim=-1, sorted=False)[1]
+        group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1.0).bool()
+        choice = choice.masked_fill(~group_mask.repeat_interleave(e // n_group, dim=1), float("-inf"))
+    _, ids = torch.topk(choice, topk, dim=-1)
+    weights = scores.gather(-1, ids)
+    if renormalize:
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    ids = ids.to(torch.int32)
+    ids[torch.arange(ids.shape[0], device=ids.device) >= num_token_non_padded] = -1
+    return weights * scale, ids
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_tokens", [1, 7, 2048])
+@pytest.mark.parametrize(
+    "num_experts,topk,n_group,topk_group,renormalize,scale",
+    [
+        (128, 8, 1, 1, True, 1.0),  # GLM-4.5-Air
+        (160, 8, 1, 1, True, 2.5),  # GLM-4.7
+        (288, 8, 1, 1, True, 2.5),  # GLM-5.3-Flash
+        (128, 4, 1, 1, True, 2.0),  # MiniMax-M3
+        (256, 8, 8, 4, True, 2.5),  # DeepSeek-V3 group-limited top-k
+        (96, 6, 3, 2, False, 1.0),  # odd group count, no renormalization
+    ],
+)
+def test_fused_topk_sigmoid_matches_torch_reference(num_tokens, num_experts, topk, n_group, topk_group, renormalize, scale):
+    from freetoken.kernel.triton.moe_router import fused_topk_sigmoid
+
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens * 31 + num_experts * 7 + topk)
+    logits = torch.randn(num_tokens, num_experts, generator=gen, device="cuda")
+    bias = torch.randn(num_experts, generator=gen, device="cuda") * 0.1
+    limit = torch.tensor(max(1, num_tokens - 3), dtype=torch.int32, device="cuda")
+
+    weights, ids = fused_topk_sigmoid(logits, bias, topk, renormalize, scale, n_group, topk_group, limit)
+    ref_w, ref_i = _reference_sigmoid_topk(logits, bias, topk, renormalize, scale, n_group, topk_group, limit)
+
+    assert weights.dtype == torch.float32 and ids.dtype == torch.int32
+    assert torch.equal(ids, ref_i)
+    torch.testing.assert_close(weights, ref_w, rtol=1e-5, atol=1e-6)

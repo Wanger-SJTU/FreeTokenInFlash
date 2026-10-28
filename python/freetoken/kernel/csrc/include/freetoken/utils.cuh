@@ -1,5 +1,6 @@
 #pragma once
 
+#include <freetoken/hip_compat.h>
 #include <freetoken/utils.h>
 
 #include <dlpack/dlpack.h>
@@ -42,16 +43,21 @@ __always_inline __device__ auto offset(const T *ptr, U... offset) -> const
 
 namespace PDL {
 
+// griddepcontrol needs sm_90+; older archs and HIP keep normal stream ordering.
 template <bool kUsePDL> __always_inline __device__ void wait() {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 900
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
+#endif
 }
 
 template <bool kUsePDL> __always_inline __device__ void launch() {
+#if !FREETOKEN_USE_ROCM && __CUDA_ARCH__ >= 900
   if constexpr (kUsePDL) {
     asm volatile("griddepcontrol.launch_dependents;" :::);
   }
+#endif
 }
 
 } // namespace PDL
@@ -115,6 +121,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if FREETOKEN_USE_ROCM
+    (void)use_pdl;
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +133,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
@@ -138,7 +149,9 @@ private:
     return config;
   }
   cudaLaunchConfig_t m_config;
+#if !FREETOKEN_USE_ROCM
   cudaLaunchAttribute m_attr_cache;
+#endif
 };
 
 } // namespace host

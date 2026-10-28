@@ -11,8 +11,7 @@ if TYPE_CHECKING:
     from freetoken.attention.linear import FLAMetadata
     from freetoken.kvcache import BaseCacheHandle, BaseKVCachePool
     from freetoken.kvcache.linear_state_pool import LinearStatePool
-    from freetoken.moe import BaseMoeBackend
-    from freetoken.moe.offload_cache import OffloadMoeCache
+    from freetoken.models.blocks import FeatureSink
 
 
 @dataclass
@@ -25,10 +24,12 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
 
     @property
     def is_greedy(self) -> bool:
-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
+        return self.temperature <= 0.0 or self.top_k == 1
 
 
 @dataclass(eq=False)
@@ -40,9 +41,12 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
-    # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
-    # hidden]) scattered at image-token positions during this request's prefill.
-    mm_embeds: torch.Tensor | None = None
+    # per-item processor outputs and the tokenizer's precomputed mrope rows and delta
+    mm_items: list | None = None
+    mrope_positions_full: torch.Tensor | None = None  # [3, prompt_len] int32, CPU
+    mrope_delta: int = 0
+    # The whole prompt's length; 0 = this request's input_ids (a ChunkedReq's end at its chunk).
+    prompt_len: int = 0
 
     # --- hybrid-radix (GDN linear-state) per-request slots; None for non-hybrid models or
     # until allocated from LinearStatePool. Set by the scheduler (P2). ---
@@ -64,11 +68,13 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    output_token_counts: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
+        self.prompt_len = self.prompt_len or self.device_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         self._alloc_ids_buf()
 
@@ -88,6 +94,15 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+
+    def widen_pending(self, k: int) -> None:
+        """Extend the pending token at cached_len by k provisional draft tokens."""
+        self.device_len += k
+
+    def commit_pending(self, n: int) -> None:
+        """Make n tokens final and leave the last committed one pending at cached_len."""
+        self.cached_len += n
+        self.device_len = self.cached_len + 1
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
@@ -112,15 +127,15 @@ class Req:
 @dataclass
 class Batch:
     reqs: List[Req]
-    phase: Literal["prefill", "decode"]
+    phase: Literal["prefill", "decode", "verify"]
+    # query rows per request: 1 on decode, more on verify, None on prefill (ragged)
+    rows_per_req: int | None = None
     # these fields should be set by scheduler
     input_ids: torch.Tensor = field(init=False)
     positions: torch.Tensor = field(init=False)
+    # [3, n] t/h/w rope positions on mrope models; positions keeps its sequence-index meaning for token_pool / page_table
+    mrope_positions: torch.Tensor | None = field(default=None, init=False)
     out_loc: torch.Tensor | None = field(init=False)
-    # Per-(padded-)request table_idx as a GPU int64 tensor, used by GatedDeltaNet
-    # decode to gather/scatter recurrent+conv state without host-side loops (so the
-    # decode step is CUDA-graph capturable). Set by the scheduler / graph buffer.
-    linear_table_idx: torch.Tensor | None = field(default=None, init=False)
     # Per-forward GatedDeltaNet metadata (cu_seqlens / cache_indices / continuation
     # flags), built once and shared by all GDN layers. Lazily built by the GDN op if
     # the scheduler/graph didn't set it.
@@ -133,8 +148,14 @@ class Batch:
     active_table_idx: "torch.Tensor | None" = None
     # this field should be set by attention backend
     attn_metadata: BaseAttnMetadata = field(init=False)
-    # concatenated multimodal soft-token embeddings for a prefill batch (or None)
+    # concatenated multimodal soft-token embeddings for a prefill batch (or None) and the batch rows they land on
     mm_embeds: torch.Tensor | None = field(default=None, init=False)
+    mm_rows: torch.Tensor | None = field(default=None, init=False)
+    # per batch token, the end (exclusive, in its request) of the image span holding it, 0 for text: the block a bidirectional layer attends within
+    mm_block_ends: torch.Tensor | None = field(default=None, init=False)
+    # this chunk's cache-miss items to encode and the gather plan [(uid, hash, row_lo, row_hi, n, pos), ...] in scatter order
+    mm_encoder_jobs: list | None = field(default=None, init=False)
+    mm_gather_plan: list | None = field(default=None, init=False)
     # Prefill log stats snapshotted at schedule time (before forward's complete_one()
     # advances cached_len), so the prefill log reports the tokens actually forwarded and
     # the prefix-cache hit -- matching SGLang's #new-token / #cached-token. Set by the
@@ -146,6 +167,14 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # per-row hidden states a draft model reads from this forward; None when nothing reads them
+    features: "FeatureSink | None" = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        if self.rows_per_req is None and self.phase == "decode":
+            self.rows_per_req = 1
+        # without it, input_mapping[0][::None] would read every row as its own request
+        assert self.phase != "verify" or self.rows_per_req is not None, "a verify batch needs rows_per_req"
 
     @property
     def is_prefill(self) -> bool:
@@ -154,6 +183,9 @@ class Batch:
     @property
     def is_decode(self) -> bool:
         return self.phase == "decode"
+
+    def get_attn_positions(self) -> torch.Tensor:
+        return self.mrope_positions if self.mrope_positions is not None else self.positions
 
     @property
     def size(self) -> int:
@@ -170,8 +202,6 @@ class Context:
     # NOTE: this table always treat page_size = 1
     page_table: torch.Tensor = field(init=False)
     attn_backend: BaseAttnBackend = field(init=False)
-    moe_backend: BaseMoeBackend = field(init=False)
-    moe_offload_cache: OffloadMoeCache | None = None
     kv_cache: BaseKVCachePool = field(init=False)
     # Per-request recurrent state for GatedDeltaNet layers; set by the engine for
     # hybrid linear-attention models, otherwise None.
@@ -184,11 +214,37 @@ class Context:
         return self._batch
 
     @contextmanager
-    def forward_batch(self, batch: Batch):
+    def override(
+        self,
+        *,
+        kv_cache: BaseKVCachePool | None = None,
+        attn_backend: BaseAttnBackend | None = None,
+        hide_target_state: bool = False,
+    ):
+        """Swap the KV pool and attention backend for a draft forward; hide_target_state also hides the target's GDN pool."""
+        swaps = {}
+        if kv_cache is not None:
+            swaps["kv_cache"] = kv_cache
+        if attn_backend is not None:
+            swaps["attn_backend"] = attn_backend
+        if hide_target_state:
+            swaps["linear_state_pool"] = None
+        saved = {name: getattr(self, name) for name in swaps}
+        try:
+            for name, value in swaps.items():
+                setattr(self, name, value)
+            yield
+        finally:
+            for name, value in saved.items():
+                setattr(self, name, value)
+
+    @contextmanager
+    def forward_batch(self, batch: Batch, **override):
         assert self._batch is None, "Nested forward_batch is not allowed"
         try:
             self._batch = batch
-            yield
+            with self.override(**override):
+                yield
         finally:
             self._batch = None
 

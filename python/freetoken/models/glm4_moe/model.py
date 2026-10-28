@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 from freetoken.core import get_global_ctx
-from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused
+from freetoken.layers import BaseOP, OPList, ParallelLMHead, RMSNormFused, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
 from freetoken.utils import nvtx_annotate
 
@@ -18,12 +18,14 @@ if TYPE_CHECKING:
 
 
 class Glm4MoeDecoderLayer(BaseOP):
-    def __init__(self, config: ModelConfig, layer_id: int):
-        self.self_attn = Glm4MoeAttention(config, layer_id)
+    def __init__(self, config: ModelConfig, layer_id: int, *, prefix: str = ""):
+        self.self_attn = Glm4MoeAttention(config, layer_id, prefix=f"{prefix}.self_attn")
         if layer_id >= config.first_k_dense_replace:
-            self.mlp: BaseOP = Glm4MoeSparseBlock(config, layer_id)
+            self.mlp: BaseOP = Glm4MoeSparseBlock(config, layer_id, prefix=f"{prefix}.mlp")
         else:
-            self.mlp = GlmGatedMLP(config.hidden_size, config.intermediate_size)
+            self.mlp = GlmGatedMLP(
+                config.hidden_size, config.intermediate_size, quant_config=config.quant, prefix=f"{prefix}.mlp"
+            )
         self.input_layernorm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNormFused(
             size=config.hidden_size, eps=config.rms_norm_eps
@@ -42,13 +44,21 @@ class Glm4MoeDecoderLayer(BaseOP):
 
 
 class Glm4MoeModel(BaseOP):
-    def __init__(self, config: ModelConfig):
-        self.embed_tokens = EmbeddingDF11(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-        )
+    def __init__(self, config: ModelConfig, *, prefix: str = "model"):
+        if config.quant is not None and config.quant.dialect == "gguf":
+            self.embed_tokens: BaseOP = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size, quant_config=config.quant, prefix=f"{prefix}.embed_tokens"
+            )
+        else:
+            self.embed_tokens = EmbeddingDF11(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
-            [Glm4MoeDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
+            [
+                Glm4MoeDecoderLayer(config, layer_id, prefix=f"{prefix}.layers.{layer_id}")
+                for layer_id in range(config.num_layers)
+            ]
         )
         self.norm = RMSNormFused(size=config.hidden_size, eps=config.rms_norm_eps)
 
@@ -68,6 +78,8 @@ class Glm4MoeForCausalLM(BaseLLMModel):
             embedding_dim=config.hidden_size,
             tie_word_embeddings=config.tie_word_embeddings,
             tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
+            quant_config=config.quant,
+            prefix="lm_head",
         )
         super().__init__()
 

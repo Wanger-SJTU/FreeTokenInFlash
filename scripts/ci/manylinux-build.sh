@@ -19,8 +19,8 @@
 #                      (default: cp312 -- the nightly/Desktop channel is cp312-only;
 #                      the release lane passes "cp310 cp311 cp312 cp313")
 #   FT_MANYLINUX_RETAG retag runtime wheels linux_x86_64 -> detected manylinux (default: 0).
-#                      Release/PyPI lane only: shipped Desktops resolve the nightly
-#                      release's assets by name and expect linux_x86_64.
+#                      Release/PyPI lane only: shipped Desktops resolve the beta
+#                      release's assets (copied from nightly) by name and expect linux_x86_64.
 #   FREETOKEN_BUILD_NO_STAMP / _RELEASE / _DEV_STAMP / _STRIP and
 #   FREETOKEN_KERNEL_CACHE_* are forwarded into the container. Other
 #   FREETOKEN_BUILD_* vars are NOT: _CLEAN is set by this script per matrix
@@ -97,11 +97,11 @@ for cptag in $MATRIX; do
   VENV="/tmp/build-venv-$cptag"
   say "creating build venv ($cptag)"
   uv venv --quiet --python "$PYBIN" "$VENV"
-  # Provenance pin: PyPI's torch 2.11.0 is itself the cu130 build, but this index
+  # Provenance pin: PyPI's torch 2.14.1 is itself the cu130 build, but this index
   # serves ONLY cu130 wheels, so the resolve can never pick a different-CUDA torch
   # and tag the kernel-cache wheel wrong; everything else is plain PyPI.
   uv pip install --quiet --python "$VENV/bin/python" \
-    --index-url https://download.pytorch.org/whl/cu130 "torch>=2.11,<2.12"
+    --index-url https://download.pytorch.org/whl/cu130 "torch>=2.14,<2.15"
   uv pip install --quiet --python "$VENV/bin/python" \
     "setuptools>=77" wheel ninja "apache-tvm-ffi==0.1.13.post3"
 

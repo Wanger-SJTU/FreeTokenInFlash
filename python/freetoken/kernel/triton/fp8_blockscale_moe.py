@@ -35,7 +35,7 @@ def _decode_fp8_moe_kernel(
     stride_twm, stride_twk, stride_tidm, stride_tidk,
     BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,  # BLOCK_K == 128 (one weight scale block)
     TOP_K: tl.constexpr, A_ROW_IS_ROUTE: tl.constexpr, MUL_ROUTED_WEIGHT: tl.constexpr,
-    compute_type: tl.constexpr,
+    compute_type: tl.constexpr, EVEN_K: tl.constexpr,
 ):
     route_id = tl.program_id(0)
     n_block = tl.program_id(1)
@@ -46,6 +46,11 @@ def _decode_fp8_moe_kernel(
     sn = offs_n // 128  # weight-scale N-block per output row
 
     slot = tl.load(topk_ids_ptr + token_id * stride_tidm + route_k * stride_tidk).to(tl.int64)
+    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+    if slot < 0:
+        # Both GEMMs must clear inactive routes before activation/reduction, including graph replay.
+        tl.store(c_ptrs, 0, mask=(route_id < total_routes) & n_mask)
+        return
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
     w_slot = w_ptr + slot * stride_we
@@ -54,7 +59,10 @@ def _decode_fp8_moe_kernel(
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     for kb in range(tl.cdiv(K, BLOCK_K)):
         offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
+        if EVEN_K:
+            k_mask = tl.full((BLOCK_K,), True, tl.int1)
+        else:
+            k_mask = offs_k < K
         if e4m3_native_cx():
             w = tl.load(
                 w_slot + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk,
@@ -66,12 +74,13 @@ def _decode_fp8_moe_kernel(
                 mask=n_mask[:, None] & k_mask[None, :], other=0,
             ))
         sc = tl.load(s_slot + sn * stride_sn + kb * stride_sk, mask=n_mask, other=0.0).to(tl.float32)
-        a = tl.load(a_base + offs_k * stride_ak, mask=k_mask, other=0.0).to(tl.float32)
-        acc += tl.sum(w * a[None, :], axis=1) * sc
+        # load the activation row at the weight tile shape so it gets the weight tile layout (no shared-memory layout conversion)
+        a_ptrs = tl.broadcast_to(a_base + offs_k[None, :] * stride_ak, (BLOCK_N, BLOCK_K))
+        a = tl.load(a_ptrs, mask=k_mask[None, :], other=0.0).to(tl.float32)
+        acc += tl.sum(w * a, axis=1) * sc
 
     if MUL_ROUTED_WEIGHT:
         acc *= tl.load(topk_weights_ptr + token_id * stride_twm + route_k * stride_twk)
-    c_ptrs = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
     tl.store(c_ptrs, acc.to(compute_type), mask=(route_id < total_routes) & n_mask)
 
 
@@ -92,20 +101,19 @@ def _decode_gemm(a, w, s, c, topk_weights, topk_ids, mul_routed_weight, a_row_is
         topk_weights.stride(0), topk_weights.stride(1), topk_ids.stride(0), topk_ids.stride(1),
         BLOCK_N=BLOCK_N, BLOCK_K=128, TOP_K=top_k,
         A_ROW_IS_ROUTE=a_row_is_route, MUL_ROUTED_WEIGHT=mul_routed_weight,
-        compute_type=_TL.get(c.dtype, tl.bfloat16), num_warps=4,
+        compute_type=_TL.get(c.dtype, tl.bfloat16), EVEN_K=w.shape[2] % 128 == 0, num_warps=4,
     )
 
 
 def fused_experts_decode_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, activation="silu",
+    topk_weights, topk_ids, activation="silu", act_alpha=1.0, act_limit=float("inf"),
 ) -> torch.Tensor:
     """Decode (bs-1) inline-dequant block-fp8 MoE. ``topk_ids`` index rows of the expert
-    banks (resident: expert id; offload: cache slot)."""
+    banks (resident: expert id; offload: cache slot); negative slots produce zero."""
     from freetoken.kernel import moe_sum_reduce_triton
-    from freetoken.layers import silu_and_mul
+    from freetoken.layers import gated_act_and_mul
 
-    assert activation == "silu"
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up.shape[1]
@@ -115,7 +123,7 @@ def fused_experts_decode_fp8_blockscale(
     ic1 = torch.empty((M, top_k, two_i), device=dev, dtype=dt)
     _decode_gemm(hidden_states, gate_up, gate_up_scale, ic1, topk_weights, topk_ids, False, False)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    silu_and_mul(ic1.view(-1, two_i), ic2)
+    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _decode_gemm(ic2, down, down_scale, ic3, topk_weights, topk_ids, True, True)
     out = torch.empty_like(hidden_states)
@@ -124,8 +132,7 @@ def fused_experts_decode_fp8_blockscale(
 
 
 # ======================================================================================
-# Prefill: M-tiled inline-dequant grouped GEMM (moe_align_block_size), mirrors
-# nvfp4_fused_moe._prefill_nvfp4_moe_kernel with fp8*bf16-block-scale dequant.
+# Prefill: M-tiled inline-dequant grouped GEMM (moe_align_block_size) with fp8*bf16-block-scale dequant.
 # BLOCK_SIZE_N == BLOCK_SIZE_K == 128 so each tile maps to one weight scale block.
 # ======================================================================================
 @triton.jit
@@ -217,16 +224,15 @@ def _prefill_gemm(a_fp8, a_scale, w, s, c, tw, sorted_ids, expert_ids, ntpp, num
 
 def fused_experts_fp8_blockscale(
     hidden_states, gate_up, gate_up_scale, down, down_scale,
-    topk_weights, topk_ids, num_experts, activation="silu",
+    topk_weights, topk_ids, num_experts, activation="silu", act_alpha=1.0, act_limit=float("inf"),
 ) -> torch.Tensor:
     """Prefill inline-dequant block-fp8 MoE. ``topk_ids`` index expert rows in [0, num_experts)
     (materialized layer: position == expert id)."""
     from freetoken.kernel import moe_sum_reduce_triton
-    from freetoken.layers import silu_and_mul
+    from freetoken.layers import gated_act_and_mul
     from freetoken.kernel.triton.fp8_block_linear import per_token_group_quant_fp8
     from freetoken.moe.fused import moe_align_block_size
 
-    assert activation == "silu"
     M, H = hidden_states.shape
     top_k = topk_ids.shape[1]
     two_i = gate_up.shape[1]
@@ -246,7 +252,7 @@ def fused_experts_fp8_blockscale(
     _prefill_gemm(a1_fp8, a1_scale, gate_up, gate_up_scale, ic1, tw, sorted_ids, expert_ids, ntpp,
                   num_valid, top_k, False, cfg)
     ic2 = torch.empty((M * top_k, inter), device=dev, dtype=dt)
-    silu_and_mul(ic1.view(-1, two_i), ic2)
+    gated_act_and_mul(activation, ic1.view(-1, two_i), ic2, alpha=act_alpha, limit=act_limit)
     a2_fp8, a2_scale = per_token_group_quant_fp8(ic2, 128)
     ic3 = torch.empty((M, top_k, H), device=dev, dtype=dt)
     _prefill_gemm(a2_fp8, a2_scale, down, down_scale, ic3, tw, sorted_ids, expert_ids, ntpp,

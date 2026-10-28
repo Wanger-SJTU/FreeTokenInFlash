@@ -16,7 +16,7 @@ JIT, which needs nvcc):
   DSV4 writes its MLA latent via torch scatter and contributes nothing.
 - index: ``element_size = hidden_size * 2`` (bf16 embedding row) paired with
   the runtime ``num_splits_for`` rule (layers/embedding.py -> kernel/index.py).
-  DSV4 (plain nn.Embedding) and GGUF embeddings (GGUFEmbedding) bypass it.
+  DSV4 (plain nn.Embedding) and GGUF embeddings (ggml get_rows) bypass it.
 
 The whole table targets the shipped serving configuration: TP=1 (TP>1 shards
 kv heads, shrinking the store row) and a 2-byte compute dtype (``--dtype
@@ -63,6 +63,13 @@ class AotModel:
     arch_aliases: tuple[str, ...] = ()
 
 
+def fp8_block_scale_pad(rows: int, cols: int) -> int:
+    """Trailing scale-bank dim padded so per-expert row bytes are 16B-aligned (fused copy)."""
+    while (rows * cols * 2) % 16:
+        cols += 1
+    return cols
+
+
 def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int) -> dict[str, int]:
     """Per-expert row bytes for each offload bank a format registers.
 
@@ -72,24 +79,22 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     """
     H, I = hidden_size, moe_intermediate_size
     if fmt == "bf16":
-        # models/loader.py stream_moe_expert_sources: gate_up [E, 2I, H], down [E, H, I], bf16
+        # bf16 expert banks: gate_up [E, 2I, H], down [E, H, I]
         return {"gate_up": 2 * I * H * 2, "down": H * I * 2}
     if fmt == "fp8_block":
-        # qwen3_5_moe/weight.py _build_fp8_expert_banks: fp8 weights + bf16 128x128 block scales
+        # block-fp8 expert banks: fp8 weights + bf16 128x128 block
+        # scales, trailing scale dim 16B-padded (same helper as the loader)
         B = 128
         return {
             "gate_up": 2 * I * H,
-            "gate_up_scale": (2 * I // B) * (H // B) * 2,
+            "gate_up_scale": (2 * I // B) * fp8_block_scale_pad(2 * I // B, H // B) * 2,
             "down": H * I,
-            "down_scale": (H // B) * (I // B) * 2,
+            "down_scale": (H // B) * fp8_block_scale_pad(H // B, I // B) * 2,
         }
-    if fmt == "q4_0":
-        # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
-        return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
-        # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
+        # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp32
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
-        # folded into GPU-resident alphas (moe/nvfp4_backends.py), so no global banks.
+        # folded into GPU-resident alphas (layers/quantization/moe/nvfp4.py), so no global banks.
         banks = {
             "gate_up_packed": 2 * I * (H // 2),
             "gate_up_scale": 2 * I * (H // 16),
@@ -97,11 +102,11 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             "down_scale": H * (I // 16),
         }
         if fmt == "nvfp4":
-            banks["gate_up_global"] = 2 * I * 2
-            banks["down_global"] = H * 2
+            banks["gate_up_global"] = 2 * I * 4
+            banks["down_global"] = H * 4
         return banks
     if fmt == "mxfp4_triton":
-        # gpt_oss/weight.py _empty_mxfp4_triton_banks: transposed split-K blocks/scales + bf16 bias
+        # gpt-oss mxfp4 expert banks: transposed split-K blocks/scales + bf16 bias
         return {
             "gate_up_blocks": (H // 2) * (2 * I),
             "gate_up_scales": (H // 32) * (2 * I),
@@ -137,6 +142,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=768,
         expert_formats=("bf16",),
         aliases=("Qwen/Qwen3-30B-A3B-Thinking-2507",),
+        # Qwen3-VL-30B-A3B: same text tower
+        arch_aliases=("Qwen3VLMoeForConditionalGeneration", "Qwen3MoeGGUFForCausalLM", "Qwen3VLMoeGGUFForCausalLM"),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B",
@@ -146,6 +153,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
+        arch_aliases=("Qwen3_5MoeForCausalLM", "Qwen3_5MoeGGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -184,6 +192,21 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # QSA compressed-sparse attention (12 of 48 layers): the QSAKVCache stores K/V
+        # through store_cache (2 kv heads x 256 head_dim), the compressed index-key slab
+        # and the pending ring write via the vendored qsa triton kernels. Hyper-connections
+        # carry the residual, so the embedding row indexing() sees is still hidden_size.
+        name="RadixArk/Qwen3.8-Flash-Next-NVFP4",
+        architecture="Qwen4ExpForConditionalGeneration",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
+        arch_aliases=("Qwen4ExpGGUFForCausalLM",),
+    ),
+    AotModel(
         name="google/gemma-4-26B-A4B-it",
         architecture="Gemma4ForConditionalGeneration",
         hidden_size=2816,
@@ -192,9 +215,8 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         kv_groups=((2, 512), (8, 256)),
         top_k=8,
         moe_intermediate_size=704,
-        # q4_0 = the Q4_0 GGUF release (Gemma4GGUFForCausalLM); its GGUFEmbedding
-        # path skips indexing(), but the bf16 safetensors path needs the variant.
-        expert_formats=("bf16", "q4_0"),
+        expert_formats=("bf16",),
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
         arch_aliases=("Gemma4ForCausalLM", "Gemma4GGUFForCausalLM"),
     ),
     AotModel(
@@ -232,6 +254,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=1536,
         expert_formats=("bf16",),
+        arch_aliases=("Glm4MoeGGUFForCausalLM",),
     ),
     AotModel(
         name="nvidia/GLM-4.7-NVFP4",
@@ -254,6 +277,21 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         expert_formats=_NVFP4_FORMATS,
     ),
     AotModel(
+        # GLM-5.3-Flash: hybrid KDA + NoPE-MLA/DSA (kpool indexer). Latent writes
+        # go through torch scatter like GLM-5.2 (no paged-KV store groups); the
+        # KDA conv/recurrent state lives in the LinearStatePool, not paged KV.
+        name="RedHatAI/GLM-5.3-Flash-NVFP4",
+        architecture="Glm5NextForCausalLM",
+        # GGUF expert rows differ per layer and reach the fused copy as runtime sizes
+        arch_aliases=("Glm5NextForConditionalGeneration", "Glm5NextGGUFForCausalLM"),
+        hidden_size=4096,
+        kv_groups=(),
+        top_k=8,
+        moe_intermediate_size=2048,
+        expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
+        aliases=("zai-org/GLM-5.3-Flash", "LibertAIDAI/GLM-5.3-Flash-NVFP4"),
+    ),
+    AotModel(
         # MiniMaxAI/MiniMax-M2.5 ships block-fp8, which has no expert-bank
         # provider for this arch on main -- the NVFP4 release is the servable
         # offload path, and both share the same attention/embedding shapes.
@@ -265,6 +303,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=1536,  # experts reuse the dense intermediate_size
         expert_formats=_NVFP4_FORMATS,
         aliases=("MiniMaxAI/MiniMax-M2.5",),
+        arch_aliases=("MiniMaxM2GGUFForCausalLM",),
     ),
     AotModel(
         # GQA block-sparse (BSA): the BSAKVCache stores K/V through store_cache
@@ -283,17 +322,41 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         moe_intermediate_size=3072,
         expert_formats=("nvfp4",),
         aliases=("MiniMaxAI/MiniMax-M3",),
-        arch_aliases=("MiniMaxM3SparseForCausalLM",),
+        arch_aliases=("MiniMaxM3SparseForCausalLM", "MiniMaxM3GGUFForCausalLM"),
     ),
     AotModel(
         name="deepseek-ai/DeepSeek-V4-Flash",
         architecture="DeepseekV4ForCausalLM",
+        # llama.cpp deepseek4 GGUF (unsloth 0731 GGUF; text only)
+        arch_aliases=("DeepseekV4GGUFForCausalLM",),
         hidden_size=4096,
         kv_groups=(),  # MLA latent pool writes via torch scatter, not store_cache
         top_k=6,
         moe_intermediate_size=2048,
         expert_formats=("ds_fp4",),
         embed_indexing=False,  # plain nn.Embedding
+    ),
+    AotModel(
+        # DSV41 pools are packed byte rows written by the dsv41 pack kernel, not store_cache;
+        # the routed experts share DSV4's ds_fp4 bank layout (hidden 5120, intermediate 2304).
+        name="deepseek-ai/DeepSeek-V4.1-Flash",
+        architecture="DeepseekV41ForCausalLM",
+        hidden_size=5120,
+        kv_groups=(),
+        top_k=6,
+        moe_intermediate_size=2304,
+        expert_formats=("ds_fp4",),
+    ),
+    AotModel(
+        name="RecursiveSI/flint",
+        architecture="FlintForCausalLM",
+        hidden_size=2048,
+        kv_groups=((4, 128),),
+        top_k=6,
+        moe_intermediate_size=512,
+        expert_formats=("bf16", *_NVFP4_FORMATS),
+        aliases=("FutureMLS-Lab/flint-nvfp4-coldgptq",),
+        arch_aliases=("FlintGGUFForCausalLM",),
     ),
     # ---- dense checkpoints (store/index only, no expert banks) ----
     AotModel(
@@ -302,13 +365,14 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=5120,
         kv_groups=((4, 256),),
         aliases=("Qwen/Qwen3.6-27B-FP8", "nvidia/Qwen3.6-27B-NVFP4"),
+        arch_aliases=("Qwen3_5ForCausalLM", "Qwen3_5GGUFForCausalLM"),  # text-only release of the same tower
     ),
     AotModel(
         name="google/gemma-4-12B-it",
         architecture="Gemma4UnifiedForConditionalGeneration",
         hidden_size=3840,
         kv_groups=((1, 512), (8, 256)),
-        arch_aliases=("Gemma4UnifiedForCausalLM",),
+        arch_aliases=("Gemma4UnifiedForCausalLM", "Gemma4UnifiedGGUFForCausalLM"),
     ),
     AotModel(
         name="nvidia/Gemma-4-31B-IT-NVFP4",
@@ -322,24 +386,29 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         hidden_size=6656,
         kv_groups=((2, 128),),  # sliding and full (NoPE) layers share the same geometry
         aliases=("RedHatAI/Muse-Glimmer-30B-NVFP4",),
+        arch_aliases=("MuseGlimmerGGUFForCausalLM",),
     ),
     AotModel(
         name="meta-llama/Llama-3.1-8B-Instruct",
         architecture="LlamaForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
+        arch_aliases=("LlamaGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen2-7B",
         architecture="Qwen2ForCausalLM",
         hidden_size=3584,
         kv_groups=((4, 128),),
+        arch_aliases=("Qwen2GGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3-8B",
         architecture="Qwen3ForCausalLM",
         hidden_size=4096,
         kv_groups=((8, 128),),
+        # Qwen3-VL: same text tower
+        arch_aliases=("Qwen3VLForConditionalGeneration", "Qwen3GGUFForCausalLM", "Qwen3VLGGUFForCausalLM"),
     ),
     AotModel(
         name="mistralai/Mistral-7B-Instruct-v0.3",
@@ -401,7 +470,8 @@ def aggregate_fast_index_copy_feature_sizes() -> tuple[int, ...]:
     sizes: set[int] = set(TEST_FEATURE_SIZES)
     for model in SUPPORTED_MODELS:
         sizes.update(fast_index_copy_feature_sizes(model))
-    return tuple(sorted(sizes))
+    # the per-bank kernel copies rows in fixed 128-byte steps; other sizes cannot compile
+    return tuple(sorted(size for size in sizes if size % 128 == 0))
 
 
 __all__ = [

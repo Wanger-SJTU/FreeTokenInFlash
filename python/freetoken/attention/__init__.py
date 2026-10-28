@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from freetoken.utils import Registry, init_logger
 
@@ -33,10 +33,8 @@ class BackendInfo:
     # Whether forward() honors a per-call AttentionSpec (window/sm_scale/sinks).
     # Non-consumers raise on a non-None spec instead of silently dropping it.
     consumes_attn_spec: bool = False
-    # Whether this backend coexists with hybrid-linear (GDN/mamba) models. The
-    # linear layers bypass the backend entirely, but a backend whose metadata or
-    # graph machinery assumes layer 0 is an attention layer can opt out here.
-    hybrid_linear_ok: bool = True
+    # How the backend captures a graph of `rows_per_req` query rows per request: "device" keeps all metadata on device, "host_plan" plans on the host before each replay, "none" cannot.
+    uniform_extend_graph: Literal["none", "host_plan", "device"] = "none"
 
 
 SUPPORTED_ATTENTION_BACKENDS = Registry[BackendCreator]("Attention Backend")
@@ -62,6 +60,7 @@ def create_trtllm_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_flashinfer=True,
+        uniform_extend_graph="host_plan",
     ),
 )
 def create_fi_backend(config: ModelConfig):
@@ -75,6 +74,7 @@ def create_fi_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL}),
         requires_sgl_kernel=True,
+        uniform_extend_graph="device",
     ),
 )
 def create_fa_backend(config: ModelConfig):
@@ -88,6 +88,7 @@ def create_fa_backend(config: ModelConfig):
     BackendInfo(
         supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
         consumes_attn_spec=True,
+        uniform_extend_graph="device",
     ),
 )
 def create_triton_backend(config: ModelConfig):
@@ -107,10 +108,25 @@ def create_dsv4_sparse_backend(config: ModelConfig):
 
 
 @SUPPORTED_ATTENTION_BACKENDS.register(
+    "dsv41_sparse",
+    BackendInfo(supported_types=frozenset({AttnType.DSV41})),
+)
+def create_dsv41_sparse_backend(config: ModelConfig):
+    from .dsv41_sparse import DSV41SparseAttnBackend
+
+    return DSV41SparseAttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
     "dsa",
     BackendInfo(supported_types=frozenset({AttnType.MLA, AttnType.DSA})),
 )
 def create_dsa_backend(config: ModelConfig):
+    # MLA with a grouped index (index_ratio > 1) is the kpool indexer layout.
+    if any(s.mla and s.index_ratio > 1 for s in config.kv_cache_group_specs()):
+        from .dsa_indexer_kpool import Glm5NextDSABackend
+
+        return Glm5NextDSABackend(config)
     from .dsa import DSAAttnBackend
 
     return DSAAttnBackend(config)
@@ -130,6 +146,21 @@ def create_m3_sparse_backend(config: ModelConfig):
     from .m3_sparse import M3SparseAttnBackend
 
     return M3SparseAttnBackend(config)
+
+
+@SUPPORTED_ATTENTION_BACKENDS.register(
+    "qsa_sparse",
+    BackendInfo(
+        supported_types=frozenset({AttnType.QSA}),
+        # 64-token pages: a 4-token compress group never straddles a page, so the
+        # compressed row of a group is page_base // 4 + block-in-page.
+        page_sizes=(64,),
+    ),
+)
+def create_qsa_sparse_backend(config: ModelConfig):
+    from .qsa_sparse import QSASparseAttnBackend
+
+    return QSASparseAttnBackend(config)
 
 
 def attention_backend_info(name: str) -> BackendInfo:

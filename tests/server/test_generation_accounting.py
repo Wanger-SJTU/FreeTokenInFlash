@@ -46,6 +46,7 @@ class FakeState:
 
     def __init__(self, replies: list[UserReply]) -> None:
         self.config = SimpleNamespace(
+            mm=SimpleNamespace(text_model_only=False, disabled_encoders=frozenset()),
             model_path="/m",
             served_model_name="unit-model",
             tool_call_parser="llama3",
@@ -88,6 +89,19 @@ def _row(*, ttft_ms: int | None) -> request_ring.RequestRecord:
 def _last_row() -> dict:
     rows, _ = request_ring.requests_since(0, 1000)
     return rows[-1]
+
+
+@pytest.mark.parametrize("pools, expected", [(None, 1), ({"page_size": 64}, 64)])
+def test_stats_reports_backend_page_size(pools, expected):
+    from freetoken.server.stats import StatsTracker, build_stats
+
+    tracker = StatsTracker()
+    tracker.kv_total_pages = 130
+    config = SimpleNamespace(served_model_name="unit-model", max_seq_len=262144,
+                             page_size=1, served_modalities=(), model_config=SimpleNamespace())
+    state = SimpleNamespace(stats=tracker, config=config, cache_pools=pools)
+    doc = build_stats(state, 0, 0)
+    assert doc["kv"] == {"used_pages": 0, "total_pages": 130, "page_size": expected}
 
 
 def test_non_stream_records_the_request_with_real_token_totals():

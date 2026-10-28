@@ -4,13 +4,17 @@ import importlib.util
 import json
 import os
 import threading
+from copy import deepcopy
 from types import ModuleType
-from typing import Any, List
+from typing import TYPE_CHECKING, Any, List
 
 import torch
-from freetoken.message import TokenizeMsg
+from freetoken.message import TokenizeMsg, UserMsg
 from freetoken.utils import init_logger
 from transformers import PreTrainedTokenizerBase
+
+if TYPE_CHECKING:
+    from freetoken.mm.processor import MMProcessor
 
 from .effort import (
     EffortProfile,
@@ -19,6 +23,7 @@ from .effort import (
     probe_thinking_profile,
     quantize_effort,
 )
+from .inline_system import has_inline_system, normalize_inline_system, probe_inline_system
 
 logger = init_logger(__name__)
 
@@ -47,16 +52,19 @@ _EFFORT_PROBE_MESSAGES = [{"role": "user", "content": "ping"}]
 
 
 class TokenizeManager:
-    def __init__(self, tokenizer: PreTrainedTokenizerBase) -> None:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, mm_processor: MMProcessor | None = None) -> None:
         self.tokenizer = tokenizer
+        self.mm_processor = mm_processor  # None: the model takes no images
         self._dsv4_encoder = _load_dsv4_encoder_if_needed(tokenizer)
         self._effort_profile: EffortProfile | None = None
         self._thinking_profile: ThinkingProfile | None = None
         self._effort_lock = threading.Lock()
-        self._logged_effort_maps: set[tuple[Any, str | None]] = set()
+        self._logged_effort_maps: set[tuple[Any, str | int | None]] = set()
+        self._inline_system_lock = threading.Lock()
+        self._inline_system_modes: dict[str, str] = {}
 
-    def tokenize(self, msgs: List[TokenizeMsg]) -> List[torch.Tensor]:
-        results: List[torch.Tensor] = []
+    def tokenize(self, msgs: List[TokenizeMsg]) -> List[UserMsg]:
+        results: List[UserMsg] = []
         # TODO: batch tokenization
         for msg in msgs:
             prompt = self.render_prompt(msg)
@@ -71,7 +79,25 @@ class TokenizeManager:
                     prompt, return_tensors="pt", add_special_tokens=not templated
                 )
             )
-            results.append(input_ids.view(-1).to(torch.int32))
+            input_ids = input_ids.view(-1).to(torch.int32)
+            if msg.images:
+                if self.mm_processor is None:
+                    raise ValueError("image input is not supported for this model")
+                mm = self.mm_processor.apply(input_ids, msg.images)
+                results.append(
+                    UserMsg(
+                        uid=msg.uid,
+                        input_ids=mm.input_ids,
+                        sampling_params=msg.sampling_params,
+                        mm_items=mm.mm_items,
+                        mrope_positions=mm.mrope_positions,
+                        mrope_delta=mm.mrope_delta,
+                    )
+                )
+            else:
+                results.append(
+                    UserMsg(uid=msg.uid, input_ids=input_ids, sampling_params=msg.sampling_params)
+                )
         return results
 
     def render_prompt(self, msg: TokenizeMsg) -> str:
@@ -81,21 +107,43 @@ class TokenizeManager:
         validation, count_tokens) must quantize identically."""
         if not isinstance(msg.text, list):
             return msg.text
-        return self._render(
-            msg.text, msg.tools, self._sanitize_effort(msg.chat_template_kwargs or {})
-        )
+        kwargs = self._sanitize_effort(msg.chat_template_kwargs or {})
+        messages = msg.text
+        if msg.inline_system_policy is not None:
+            if msg.inline_system_policy not in ("auto", "preserve", "fold"):
+                raise ValueError(f"invalid inline system policy: {msg.inline_system_policy}")
+            if has_inline_system(messages):
+                mode = msg.inline_system_policy
+                if mode == "auto":
+                    mode = self.inline_system_mode(msg.tools, kwargs)
+                messages = normalize_inline_system(messages, mode)
+        return self._render(messages, msg.tools, kwargs, images=msg.images)
+
+    def inline_system_mode(self, tools: list[dict] | None, kwargs: dict[str, Any]) -> str:
+        key = json.dumps([tools, kwargs], sort_keys=True)
+        with self._inline_system_lock:
+            if key not in self._inline_system_modes:
+                mode, reason = probe_inline_system(
+                    lambda messages: self._render(messages, deepcopy(tools), deepcopy(kwargs)), self.tokenizer
+                )
+                if len(self._inline_system_modes) >= 128:
+                    self._inline_system_modes.pop(next(iter(self._inline_system_modes)))
+                self._inline_system_modes[key] = mode
+                logger.info("Anthropic inline system policy: %s (%s)", mode, reason)
+            return self._inline_system_modes[key]
 
     def _render(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any],
+        *, images: list[bytes] | None = None,
     ) -> str:
         """Raw render, no effort sanitation — the probe needs unsupported values
         to actually reach the template so rejection is observable."""
         if self._dsv4_encoder is not None:
             return _apply_dsv4_chat_encoder(
-                self._dsv4_encoder, messages, tools, chat_template_kwargs
+                self._dsv4_encoder, messages, tools, chat_template_kwargs, images=images
             )
         # Broadcast the effort in every spelling the ecosystem's templates read
         # (muse-glimmer grades ``reasoning_strength``; Jinja ignores undeclared
@@ -175,8 +223,12 @@ def _load_dsv4_encoder_if_needed(tokenizer: PreTrainedTokenizerBase) -> ModuleTy
     model_path = getattr(tokenizer, "name_or_path", None) or getattr(tokenizer, "_name_or_path", "")
     if not model_path:
         return None
-    encoder_path = os.path.join(str(model_path), "encoding", "encoding_dsv4.py")
-    if not os.path.isfile(encoder_path):
+    # DeepSeek-V4 ships encoding/encoding_dsv4.py, V4.1 encoding/encoding.py; same encode_messages contract
+    encoder_path = next(
+        (p for p in (os.path.join(str(model_path), "encoding", name) for name in ("encoding_dsv4.py", "encoding.py")) if os.path.isfile(p)),
+        None,
+    )
+    if encoder_path is None:
         return None
     spec = importlib.util.spec_from_file_location("encoding_dsv4", encoder_path)
     if spec is None or spec.loader is None:
@@ -193,9 +245,28 @@ def _apply_dsv4_chat_encoder(
     messages: list[dict],
     tools: list[dict] | None,
     chat_template_kwargs: dict,
+    *, images: list[bytes] | None = None,
 ) -> str:
     rendered_messages = [dict(message) for message in messages]
+    image_data = iter(images) if images is not None else None
     for message in rendered_messages:
+        if isinstance(message.get("content"), list):
+            content = []
+            for part in message["content"]:
+                if isinstance(part, dict) and part.get("type") == "image":
+                    # Prerender still has refs; the tokenizer worker receives fetched bytes.
+                    # The checkpoint encoder validates sources even when rendering only text.
+                    ref = part.get("freetoken_ref")
+                    if image_data is not None:
+                        try:
+                            part = {"type": "image", "data": next(image_data)}
+                        except StopIteration:
+                            raise ValueError("image blocks outnumber fetched images") from None
+                    elif ref is not None:
+                        key = "data" if ref["kind"] == "b64" else "url"
+                        part = {"type": "image", key: ref["data"]}
+                content.append(part)
+            message["content"] = content
         if message.get("tool_calls"):
             message["tool_calls"] = _dsv4_tool_calls(message["tool_calls"])
     if tools:

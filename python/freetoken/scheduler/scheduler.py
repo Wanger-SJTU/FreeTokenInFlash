@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
+import time
+
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
-from freetoken.attention.linear import build_fla_metadata
 from freetoken.core import Batch, Req
 from freetoken.env import ENV
+from freetoken.gpu_select import gpu_identity
 from freetoken.message import (
     AbortBackendMsg,
     BaseBackendMsg,
@@ -15,6 +18,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     ExitMsg,
+    FlushCacheBackendMsg,
+    FlushCacheResultMsg,
     PromptAdmittedMsg,
     UserMsg,
 )
@@ -29,6 +34,7 @@ from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
 from .io import SchedulerIOMixin
+from .mm import cut_image_spans, plan_mm_batch
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
 from .table import TableManager
@@ -68,6 +74,8 @@ class Scheduler(SchedulerIOMixin):
         self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
+        # sent on the readiness ack for /v1/stats gpus; a list so TP can add one entry per rank
+        self.gpus = [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
 
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
@@ -84,9 +92,16 @@ class Scheduler(SchedulerIOMixin):
                 None,
             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
         )
-        self.decode_manager = DecodeManager(config.page_size)
+        token_headroom = config.decode_rows_per_req - 1
+        self.decode_manager = DecodeManager(config.page_size, token_headroom=token_headroom)
+        self._bidirectional_mm = any(getattr(g, "bidirectional_mm_blocks", False) for g in config.model_config.attention_groups)
         self.prefill_manager = PrefillManager(
-            self.cache_manager, self.table_manager, self.decode_manager
+            self.cache_manager,
+            self.table_manager,
+            self.decode_manager,
+            encoder_cache=self.engine.encoder_cache,
+            keep_images_whole=self._bidirectional_mm,
+            token_headroom=token_headroom,
         )
 
         # some alias for easy access
@@ -109,6 +124,8 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        # A /v1/cache/flush waiting for the idle safe point, with its time.monotonic() deadline.
+        self._pending_flush: Tuple[FlushCacheBackendMsg, float] | None = None
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -130,13 +147,22 @@ class Scheduler(SchedulerIOMixin):
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
         self.config = config
+        self._model_is_mrope = config.model_config.model_is_mrope
+        self._warned_cut_image = False
+        moe_cache = getattr(self.engine, "moe_offload_cache", None)
         self.status_reporter = SchedulerStatusReporter(
             log=logger.info_rank0,
             decode_log_interval=config.decode_log_interval,
+            moe_stats=self._moe_stats_line if config.moe_collect_stats and moe_cache is not None else None,
         )
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
+
+    def _moe_stats_line(self) -> str | None:
+        # on the engine stream, so the read and the zeroing fall between decode replays
+        with torch.cuda.stream(self.engine.stream):
+            return self.engine.moe_offload_cache.decode_stats_line()
 
     def run_when_idle(self) -> None:
         """Called when the scheduler is idle to perform background tasks."""
@@ -207,6 +233,7 @@ class Scheduler(SchedulerIOMixin):
             or self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to drain toward + execute
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -218,6 +245,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        self._check_pending_flush()
 
         # Order this iteration's host->device token_pool copies (issued on ``self.stream``
         # during scheduling) after the previous batch's sampled-token writes (issued on the
@@ -252,6 +280,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable
             or self.decode_manager.runnable
             or self._pending_rebuild is not None  # a queued rebuild to execute at idle
+            or self._pending_flush is not None  # a deferred flush to run at idle or time out
         )
         for msg in self.receive_msg(blocking=blocking):
             self._process_one_msg(msg)
@@ -263,6 +292,7 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.runnable or self.decode_manager.runnable
         ):
             self._execute_pending_rebuild()
+        self._check_pending_flush()
 
         forward_input = self._schedule_next_batch()
         ongoing_data = None
@@ -331,42 +361,9 @@ class Scheduler(SchedulerIOMixin):
                     # are freed below/already; shipping this token would append past the
                     # client's terminal reply.
                     continue
-                next_token = next_tokens_cpu[i]
-                req.append_host(next_token.unsqueeze(0))
-                next_token = int(next_token.item())
-                # EOS / stop-string -> "stop", output budget exhausted -> "length";
-                # EOS and stop strings win over length.
-                hit_length = not req.can_decode
-                hit_eos = (
-                    not req.sampling_params.ignore_eos and next_token in self.eos_token_ids
-                )
-                matched_stop = (
-                    self._match_stop_str(req)
-                    if not hit_eos and req.sampling_params.stop_strs
-                    else None
-                )
-                finished = hit_length or hit_eos or matched_stop is not None
-                finish_reason = (
-                    ("stop" if (hit_eos or matched_stop is not None) else "length")
-                    if finished
-                    else None
-                )
-                if (
-                    next_token == self.toolcall_anchor_id
-                    and req.toolcall_anchor_len is None
-                    and not finished
-                ):
-                    req.toolcall_anchor_len = req.input_ids.numel()
-                reply.append(
-                    DetokenizeMsg(
-                        uid=req.uid,
-                        next_token=next_token,
-                        finished=finished,
-                        finish_reason=finish_reason,
-                        matched_stop=matched_stop,
-                        stop_strs=req.sampling_params.stop_strs or None,
-                    )
-                )
+                msg, _ = self._commit_tokens(req, next_tokens_cpu[i : i + 1])
+                reply.append(msg)
+                finished = msg.finished
 
                 # NOTE: overlap scheduling may make the request freed twice, skip second free
                 if finished and req not in self.finished_reqs:
@@ -413,6 +410,37 @@ class Scheduler(SchedulerIOMixin):
             swa_tokens=swa_tokens,
         )
         self.send_result(reply)
+
+    def _commit_tokens(self, req: Req, tokens: torch.Tensor) -> Tuple[DetokenizeMsg, int]:
+        """Append sampled tokens in order until one finishes the request; returns the reply and how many tokens were committed."""
+        params = req.sampling_params
+        committed: List[int] = []
+        finished, finish_reason, matched_stop = False, None, None
+        for j in range(tokens.numel()):
+            req.append_host(tokens[j : j + 1])
+            token = int(tokens[j].item())
+            committed.append(token)
+            # EOS / stop-string -> "stop", output budget exhausted -> "length";
+            # EOS and stop strings win over length.
+            # Overlap can advance device_len one token ahead of this host reply.
+            hit_length = req.input_ids.numel() >= req.max_device_len
+            hit_eos = not params.ignore_eos and token in self.eos_token_ids
+            matched_stop = self._match_stop_str(req) if not hit_eos and params.stop_strs else None
+            if hit_length or hit_eos or matched_stop is not None:
+                finished = True
+                finish_reason = "stop" if (hit_eos or matched_stop is not None) else "length"
+                break
+            if token == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
+                req.toolcall_anchor_len = req.input_ids.numel()
+        msg = DetokenizeMsg(
+            uid=req.uid,
+            next_tokens=committed,
+            finished=finished,
+            finish_reason=finish_reason,
+            matched_stop=matched_stop,
+            stop_strs=params.stop_strs or None,
+        )
+        return msg, len(committed)
 
     def _match_stop_str(self, req: Req) -> str | None:
         """First stop string present in this request's generated tail, else None. Decodes
@@ -486,6 +514,17 @@ class Scheduler(SchedulerIOMixin):
                     "Dropping request %d because its abort arrived before admission", msg.uid
                 )
                 return
+            if msg.mm_items and self.engine.encoder_cache is None:
+                # no encoder runtime: fail loudly instead of decoding unexpanded placeholders
+                self.send_result(
+                    [
+                        ErrorReplyMsg(
+                            uid=msg.uid,
+                            error="image input is not supported by this server",
+                        )
+                    ]
+                )
+                return
             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
             max_output_len = max_seq_len - input_len
             if max_output_len <= 0:
@@ -531,6 +570,15 @@ class Scheduler(SchedulerIOMixin):
                 tombstones.pop(next(iter(tombstones)))
             req_to_free = self.prefill_manager.abort_req(msg.uid)
             req_to_free = req_to_free or self.decode_manager.abort_req(msg.uid)
+            if (
+                req_to_free is not None
+                and req_to_free.mm_items
+                and self.engine.encoder_cache is not None
+            ):
+                # drop the aborted request's claims; entries it held alone die here
+                self.engine.encoder_cache.release(
+                    msg.uid, [item.hash for item in req_to_free.mm_items]
+                )
             if req_to_free is not None:
                 # SGLang-style abort: never free resources under an in-flight forward. If the
                 # request is in the launched-but-not-drained batch (overlap), only mark it;
@@ -575,6 +623,8 @@ class Scheduler(SchedulerIOMixin):
                 self._reply_rebuild(msg.request_id, "busy")
             else:
                 self._pending_rebuild = msg
+        elif isinstance(msg, FlushCacheBackendMsg):
+            self._handle_flush(msg)
         else:
             logger.error(f"Unknown message type: {type(msg)}")
             raise NotImplementedError
@@ -696,6 +746,43 @@ class Scheduler(SchedulerIOMixin):
         self._log_cache_geometry("Cache rebuilt")
         self._reply_rebuild(msg.request_id, "ok")
 
+    def _handle_flush(self, msg: FlushCacheBackendMsg) -> None:
+        # Same idle/timeout contract as sglang's /flush_cache. Even timeout=0 waits for this iteration's safe point.
+        if self.config.tp_info.size > 1:
+            # each rank checks the deadline on its own clock, so a deferred flush could run on only some ranks
+            self._reply_flush(msg.request_id, "unsupported", "cache flush unsupported under TP > 1")
+        elif self._pending_flush is not None:
+            self._reply_flush(msg.request_id, "busy", "another cache flush is already waiting")
+        else:
+            self._pending_flush = (msg, time.monotonic() + msg.timeout)
+
+    def _check_pending_flush(self) -> None:
+        """Run the pending flush once the scheduler is fully idle, or fail it at its deadline."""
+        if self._pending_flush is None:
+            return
+        msg, deadline = self._pending_flush
+        if self._last_data is None and not (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            self._pending_flush = None
+            freed = self.cache_manager.flush()
+            self.cache_manager.check_integrity()
+            logger.info_rank0(f"Cache flushed: {freed} prefix-cache tokens freed")
+            self._reply_flush(msg.request_id, "ok")
+        elif time.monotonic() >= deadline:
+            self._pending_flush = None
+            error = (
+                "scheduler is not idle: "
+                f"{len(self.prefill_manager.pending_list)} queued, "
+                f"{len(self.decode_manager.running_reqs)} running"
+                + (", last batch still in flight" if self._last_data is not None else "")
+            )
+            logger.warning_rank0(f"Cache not flushed, {error}")
+            self._reply_flush(msg.request_id, "timeout" if msg.timeout > 0 else "busy", error)
+
+    def _reply_flush(self, request_id: str, status: str, error: str | None = None) -> None:
+        self.send_result([FlushCacheResultMsg(request_id=request_id, status=status, error=error)])
+
     def _current_cache_geometry(self) -> dict:
         """The pools' current (serving) sizes as rebuild_cache kwargs — the rollback snapshot and
         the single source for _reply_rebuild's readout. None for a pool this model lacks
@@ -703,17 +790,10 @@ class Scheduler(SchedulerIOMixin):
         the CONCRETE current window (usable pages) so a rollback restores it byte-for-byte,
         whether it was pinned or ratio-derived."""
         eng = self.engine
-        config = self.config
-        mc = config.model_config
-        num_swa_pages = None
-        if getattr(mc, "dsv4_args", None) is not None:
-            sizes = getattr(eng.kv_cache, "sizes", None)
-            if sizes is not None:  # usable window pages = physical n_win_pages minus the dummy page
-                num_swa_pages = max(0, sizes.n_win_pages - 1)
-        elif getattr(mc, "has_swa_attention", False) and (
-            getattr(config, "cache_type", None) == "swa_radix"
-        ):  # usable window tokens = pool tokens minus the slot-0 sentinel
-            num_swa_pages = max(0, int(getattr(eng.kv_cache, "swa_num_tokens", 0) or 0) - 1)
+        from freetoken.kvcache.cache_status import window_pool_spec
+
+        spec = window_pool_spec(self.config)
+        num_swa_pages = eng.kv_cache.window_pages if spec is not None else None
         return dict(
             num_pages=eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
@@ -759,7 +839,7 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self._forward_iter += 1
-        if batch.is_decode:
+        if not batch.is_prefill:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
             # so they can back the new token -- this is what bounds the per-request swa
             # footprint during decode. (no-op unless the model is SWA / paged swa pool.)
@@ -778,35 +858,17 @@ class Scheduler(SchedulerIOMixin):
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
+        if self._model_is_mrope:
+            batch.mrope_positions = _make_mrope_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
-        if self.engine.linear_state_pool is not None:
-            if batch.is_decode:
-                # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
-                # lands in the CUDA-graph input buffer via copy_from. Gate on the cache mode,
-                # NOT on whether any padded req has a linear_slot_idx -- the persistent dummy
-                # req always carries one (= padding_slot), so that test is True even for naive
-                # and would collapse all real naive reqs onto the padding slot. Hybrid: build
-                # per padded req from Req.linear_slot_idx (dummy -> padding_slot). Naive: keep
-                # the old keying = input_mapping's table_idx column (already staged, no H2D).
-                if self.cache_manager.is_hybrid:
-                    pool = self.engine.linear_state_pool
-                    slots = [r.linear_slot_idx if r.linear_slot_idx is not None
-                             else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
-                else:
-                    batch.linear_table_idx = input_mapping[0].to(torch.int32)
-            # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
-            # built once here instead of rebuilt in each of the 30 GDN layers. For decode
-            # under CUDA graph the persistent cu_seqlens buffer is supplied by set_batch.
-            batch.fla_metadata = build_fla_metadata(batch, self.device)
-        if batch.is_decode:
+        if self.engine.linear_backend is not None:
+            self.engine.linear_backend.prepare_metadata(batch)
+        if not batch.is_prefill:
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
-            batch.active_table_idx = input_mapping[0].view(-1)
+            batch.active_table_idx = input_mapping[0][:: batch.rows_per_req].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,
@@ -816,14 +878,20 @@ class Scheduler(SchedulerIOMixin):
         )
 
     def _gather_multimodal(self, batch: Batch) -> None:
-        """Concatenate per-request vision soft tokens (in request order) for a prefill
-        batch so the model can scatter them at image-token positions. ``req.mm_embeds``
-        is kept (not cleared) so the cache manager can recognize multimodal requests and
-        keep them out of the shared prefix cache (image placeholders share a token id but
-        carry per-image content)."""
-        parts = [req.mm_embeds for req in batch.reqs if req.mm_embeds is not None]
-        if parts:
-            batch.mm_embeds = torch.cat(parts, dim=0)
+        """Plan the chunk's encoder jobs, gather rows and scatter rows over the batch; the engine runs them before the LM forward."""
+        jobs, plan, rows, block_ends = plan_mm_batch(batch.padded_reqs, self.engine.encoder_cache)
+        if plan:
+            batch.mm_encoder_jobs = jobs
+            batch.mm_gather_plan = plan
+            batch.mm_rows = torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(self.device, non_blocking=True)
+            batch.mm_block_ends = torch.tensor(block_ends, dtype=torch.int32, pin_memory=True).to(self.device, non_blocking=True)
+        if self._bidirectional_mm and not self._warned_cut_image and (cut := cut_image_spans(batch.padded_reqs)):
+            # only a bidirectional image span loses context when cut, and only an image longer than the chunk still gets cut
+            lo, hi = cut[0]
+            self._warned_cut_image = True
+            logger.warning_rank0(
+                f"an image of {hi - lo} tokens does not fit one prefill chunk (--max-extend-tokens {self.prefill_budget}, or the sliding-window pool's share of it): its earlier rows attend within the first part only"
+            )
 
     def _schedule_next_batch(self) -> ForwardInput | None:
         # TODO: support other policies: e.g. DECODE first
@@ -869,6 +937,28 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
+
+
+def _make_mrope_positions(batch: Batch, device: torch.device) -> torch.Tensor:
+    """[3, N] rope rows: an image request's prompt tokens use their precomputed columns, everything else is sequence index + per-request delta."""
+    needed = sum(r.extend_len for r in batch.padded_reqs)
+    host = torch.empty((3, needed), dtype=torch.int32, pin_memory=True)
+    offset = 0
+    for req in batch.padded_reqs:
+        length = req.extend_len
+        out = host[:, offset : offset + length]
+        full = req.mrope_positions_full
+        if full is not None and req.device_len <= full.shape[1]:
+            out.copy_(full[:, req.cached_len : req.device_len])
+        else:
+            row = torch.arange(
+                req.cached_len + req.mrope_delta,
+                req.device_len + req.mrope_delta,
+                dtype=torch.int32,
+            )
+            out.copy_(row.unsqueeze(0).expand(3, -1))
+        offset += length
+    return host.to(device, non_blocking=True)
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

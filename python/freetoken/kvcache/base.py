@@ -21,7 +21,10 @@ def spec_kv_bytes_per_token(spec, config) -> int:
     x layers, plus the bf16 DSA index-key slab when the spec carries indexer dims. Pure
     per-spec arithmetic -- pool families compose it over THEIR OWN groups; no family
     branching here. (2 bytes/elem == the torch.bfloat16 dsa_pool.DSAKVCache._alloc
-    hardcodes; keep the two in lockstep if the slab dtype ever changes.)"""
+    hardcodes; keep the two in lockstep if the slab dtype ever changes.)
+
+    ``index_ratio`` > 1 (QSA) stores one index key per token group, not per token; that slab's
+    ring and scratch rows are fixed-size and priced in QSAKVCache.kv_cost instead."""
     per_token = (
         (1 if spec.mla else 2)  # MLA latent groups store one slab (V aliases K)
         * spec.head_dim
@@ -29,7 +32,15 @@ def spec_kv_bytes_per_token(spec, config) -> int:
         * config.dtype.itemsize
         * spec.num_layers
     )
-    return per_token + spec.index_head_dim * spec.num_index_layers * 2
+    return per_token + spec.index_head_dim * spec.num_index_layers * 2 // spec.index_ratio
+
+
+@dataclass(frozen=True)
+class WindowPoolSpec:
+    """Window resize units and minimum usable capacity, excluding reserved pages."""
+
+    page_size: int
+    min_pages: int
 
 
 class BaseKVCachePool(ABC):
@@ -41,6 +52,15 @@ class BaseKVCachePool(ABC):
     # Pools whose buffers are bound into per-forward model scratch (DSV4's tiers) need the
     # model re-bound after a rebuild; the engine asks before it resizes.
     needs_rebind_on_rebuild: ClassVar[bool] = False
+
+    @classmethod
+    def window_spec(cls, config) -> WindowPoolSpec | None:
+        return None
+
+    @property
+    def window_pages(self) -> int:
+        """Current usable window pages in the units declared by window_spec."""
+        return 0
 
     # ---- sizing/cost classmethods: run BEFORE the pool exists (startup budget solve,
     # --moe-cache-auto). The engine measures memory and passes bytes in; each pool family

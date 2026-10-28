@@ -27,7 +27,8 @@ class BatchTokenizerMsg(BaseTokenizerMsg):
 @dataclass
 class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
-    next_token: int
+    # tokens committed this step, in order: one per decode step, up to k+1 per speculative verify
+    next_tokens: List[int]
     finished: bool
     finish_reason: str | None = None
     # The stop string that ended generation (if any), so the detokenizer can trim it
@@ -72,6 +73,8 @@ class TokenizeMsg(BaseTokenizerMsg):
     sampling_params: SamplingParams
     chat_template_kwargs: Dict[str, Any] | None = None
     tools: List[Dict[str, Any]] | None = None
+    images: List[bytes] | None = None
+    inline_system_policy: str | None = None
 
 
 @dataclass
@@ -99,6 +102,21 @@ class CacheRebuildResultMsg(BaseTokenizerMsg):
     num_pages: int = 0
     mamba_slots: int = 0
     num_swa_pages: int = 0
+    error: str | None = None
+
+
+@dataclass
+class FlushCacheMsg(BaseTokenizerMsg):
+    # api server -> tokenizer worker (pure passthrough to FlushCacheBackendMsg).
+    request_id: str
+    timeout: float = 0.0
+
+
+@dataclass
+class FlushCacheResultMsg(BaseTokenizerMsg):
+    # scheduler -> detokenizer worker (passthrough to FlushCacheReply).
+    request_id: str
+    status: str  # "ok" | "busy" | "timeout" | "unsupported"
     error: str | None = None
 
 

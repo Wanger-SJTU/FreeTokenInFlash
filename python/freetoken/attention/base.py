@@ -20,10 +20,17 @@ class AttnType(str, Enum):
     MLA = "mla"  # plain latent-KV MLA -> MLAKVCache
     DSA = "dsa"  # latent-KV MLA + DSA sparse indexer -> DSAKVCache
     DSV4 = "dsv4"  # DSV4 window+compressed sparse -> DSV4PagedKVCache
+    # DSV41 (DeepSeek-V4.1): window + cross-layer-shared compressed KV in packed fp8/fp4
+    # rows, Full/Reindex/Reuse layer modes -> DSV41PagedKVCache
+    DSV41 = "dsv41"
     LINEAR = "linear"  # GDN/mamba state layers -> LinearStatePool
     # GQA block-sparse (MiniMax-M3): paged GQA K/V + a per-sparse-layer index-key
     # slab; the indexer picks top-k 128-token blocks per query -> BSAKVCache
     BSA = "bsa"
+    # QSA compressed-block sparse (Qwen3.8-Flash-Next): paged GQA K/V + a compressed
+    # index-key slab (one row per index_ratio tokens, row = slot // index_ratio) +
+    # a per-request pending ring for unclosed groups -> QSAKVCache
+    QSA = "qsa"
 
     @property
     def backend_driven(self) -> bool:
@@ -37,6 +44,8 @@ class AttentionSpec:
     sliding_window: int | None = None
     sm_scale: float | None = None
     sinks: torch.Tensor | None = None
+    # rows of a multimodal span (batch.mm_block_ends) also attend to the span's later keys
+    bidirectional_mm_blocks: bool = False
 
 
 @dataclass
@@ -61,7 +70,8 @@ class BaseAttnBackend(ABC):
     def prepare_metadata(self, batch: Batch) -> None: ...
 
     @abstractmethod
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None: ...
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        """Static buffers for graphs of ``rows_per_req`` query rows per request: 1 for decode, more for a uniform extend."""
 
     @abstractmethod
     def prepare_for_capture(self, batch: Batch) -> None: ...
@@ -107,8 +117,8 @@ class HybridBackend(BaseAttnBackend):
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.prepare_metadata(batch)
 
-    def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
-        self.decode_backend.init_capture_graph(max_seq_len, bs_list)
+    def init_capture_graph(self, max_seq_len: int, bs_list: List[int], rows_per_req: int = 1) -> None:
+        self.decode_backend.init_capture_graph(max_seq_len, bs_list, rows_per_req)
 
     def prepare_for_capture(self, batch: Batch) -> None:
         self.decode_backend.prepare_for_capture(batch)

@@ -41,7 +41,9 @@ def _hf_indexer(seq: int, topk: int):
     freqs = torch.outer(pos.float(), inv)
     emb = torch.cat((freqs, freqs), dim=-1)
     cos, sin = emb.cos()[None].to(torch.bfloat16), emb.sin()[None].to(torch.bfloat16)
-    ref_topk = idx(x, q_resid, (cos, sin), None, pos[None])  # [1, S, topk]
+    # bool causal mask, True = visible: since transformers 5.18 the indexer no longer builds one when given None
+    causal = (pos[None, :] <= pos[:, None])[None]
+    ref_topk = idx(x, q_resid, (cos, sin), causal, pos[None])  # [1, S, topk]
     return idx, x, q_resid, pos, ref_topk
 
 
@@ -225,6 +227,72 @@ def test_splitk_matches_single_program():
     assert (o_single.float() - o_split.float()).abs().max().item() < 1e-2
 
 
+@pytest.mark.parametrize("dr", [64, 0])
+def test_strided_q_and_out_slice_write(dr):
+    """The glm5_next NoPE plumbing hands the kernel a TRANSPOSED bmm output view as
+    q (no [T, H, d] contiguous copy) and writes the result into a slice of the
+    [T, H, d_v] prefill workspace (out=). Both must reproduce the contiguous-q /
+    fresh-allocation path exactly: same kernel, same inputs, only strides differ.
+    dr = 0 pins the NoPE compile variant glm5_next runs; dr = 64 the roped one."""
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+
+    torch.manual_seed(4)
+    h, dv, n, m = 8, 64, 300, 6
+    pool = torch.randn(n + 20, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    rows = torch.randperm(n + 20, device="cuda")[:n].to(torch.int32)
+    q_mat = torch.randn(h, m, dv + dr, device="cuda", dtype=torch.bfloat16)  # bmm-style [H, m, d]
+    q_strided = q_mat.transpose(0, 1)  # [m, h, d] view -- what mla_forward receives
+
+    idx = torch.full((1, 1, n), -1, device="cuda", dtype=torch.int32)
+    idx[0, 0] = rows
+    pos = torch.arange(n - m, n, device="cuda")
+    cnt = (pos + 1).to(torch.int32).view(1, m)
+    scale = (dv + dr) ** -0.5
+
+    o_ref = glm_dsa_sparse_attn(
+        q_strided.contiguous().unsqueeze(0), pool, idx, scale, counts=cnt, d_v=dv,
+    )
+
+    ws = torch.full((64, h, dv), float("nan"), device="cuda", dtype=torch.bfloat16)
+    glm_dsa_sparse_attn(
+        q_strided.unsqueeze(0), pool, idx, scale, counts=cnt, d_v=dv,
+        out=ws[10 : 10 + m].view(1, m, h, dv),
+    )
+    assert torch.equal(ws[10 : 10 + m], o_ref[0]), "strided q / slice out != contiguous path"
+    assert torch.isnan(ws[:10]).all() and torch.isnan(ws[10 + m :]).all(), \
+        "kernel wrote outside the out= slice"
+
+
+@pytest.mark.parametrize("dr", [64, 0])
+def test_splitk_writes_out_slice(dr):
+    """An m == 1 prefill (a radix-hit prompt) auto-selects split-k; the merge stage
+    must write the merged result into an arbitrary out= slice exactly like the
+    single-program kernel does."""
+    from freetoken.kernel.triton.glm_dsa_sparse import glm_dsa_sparse_attn
+
+    torch.manual_seed(6)
+    h, dv, n = 8, 64, 300
+    pool = torch.randn(n + 20, dv + dr, device="cuda", dtype=torch.bfloat16) * 0.5
+    rows = torch.randperm(n + 20, device="cuda")[:n].to(torch.int32)
+    q_mat = torch.randn(h, 1, dv + dr, device="cuda", dtype=torch.bfloat16)
+    q = q_mat.transpose(0, 1).unsqueeze(0)  # [1, 1, h, d] strided view
+    idx = rows.view(1, 1, n)
+    cnt = torch.tensor([[n]], device="cuda", dtype=torch.int32)
+    scale = (dv + dr) ** -0.5
+
+    o_ref = glm_dsa_sparse_attn(
+        q.contiguous(), pool, idx, scale, counts=cnt, d_v=dv, force_splits=4,
+    )
+    ws = torch.full((4, h, dv), float("nan"), device="cuda", dtype=torch.bfloat16)
+    glm_dsa_sparse_attn(
+        q, pool, idx, scale, counts=cnt, d_v=dv, force_splits=4,
+        out=ws[2:3].view(1, 1, h, dv),
+    )
+    assert torch.equal(ws[2], o_ref[0, 0]), "split-k merge into out= slice != reference"
+    assert torch.isnan(ws[:2]).all() and torch.isnan(ws[3:]).all(), \
+        "split-k wrote outside the out= slice"
+
+
 def _make_backend(dsa: bool, latent=80, dv=64, idx_dim=32, idx_heads=16, topk=64, pages=400):
     """Minimal ctx + pool + DSAAttnBackend (no engine)."""
     from types import SimpleNamespace
@@ -298,11 +366,15 @@ def test_backend_ragged_prefill_identity_and_selection():
     q_pe = torch.randn(t, h, dr, device="cuda", dtype=torch.bfloat16)
     c_kv = torch.randn(t, dv, device="cuda", dtype=torch.bfloat16)
     k_rope = torch.randn(t, dr, device="cuda", dtype=torch.bfloat16)
-    qkw = (torch.randn(t, idx_h, idx_d, device="cuda", dtype=torch.bfloat16),
-           torch.randn(t, idx_d, device="cuda", dtype=torch.bfloat16),
-           torch.randn(t, idx_h, device="cuda").abs())
+    from freetoken.attention.dsa import DSAIndexerInputs
 
-    o0 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch, indexer_qkw=qkw)
+    qkw = DSAIndexerInputs(
+        q=torch.randn(t, idx_h, idx_d, device="cuda", dtype=torch.bfloat16),
+        k=torch.randn(t, idx_d, device="cuda", dtype=torch.bfloat16),
+        w=torch.randn(t, idx_h, device="cuda").abs(),
+    )
+
+    o0 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch, indexer_inputs=qkw)
 
     # request A (kv <= topk): selection covers all live -> equals dense reference
     q_cat = torch.cat([q_nope, q_pe], -1)
@@ -313,7 +385,7 @@ def test_backend_ragged_prefill_identity_and_selection():
         assert (o0[j].float() - ref).abs().max().item() < 3e-2, f"A q{j}"
 
     # request B (kv > topk): causal top-k reference from the same scoring math
-    q_idx, k_idx, w = qkw
+    q_idx, k_idx, w = qkw.q, qkw.k, qkw.w
     for j in (0, 11):  # first and last of B's queries
         row = 8 + j
         pos = 88 + j
@@ -327,7 +399,7 @@ def test_backend_ragged_prefill_identity_and_selection():
 
     # leader/follower: layer 1 (shared, no indexer) reuses layer 0's selection; with
     # identical latent content its output must match layer 0's
-    o1 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 1, batch, indexer_qkw=None)
+    o1 = backend.mla_forward(q_nope, q_pe, c_kv, k_rope, 1, batch, indexer_inputs=None)
     assert (o0.float() - o1.float()).abs().max().item() < 3e-2
 
     # identity wiring (dense ablation): same batch through an MLAKVCache backend
@@ -338,7 +410,7 @@ def test_backend_ragged_prefill_identity_and_selection():
     batch_d = SimpleNamespace(reqs=reqs, positions=positions, out_loc=out_loc,
                               active_table_idx=None, attn_metadata=None)
     backend_d.prepare_metadata(batch_d)
-    od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_qkw=None)
+    od = backend_d.mla_forward(q_nope, q_pe, c_kv, k_rope, 0, batch_d, indexer_inputs=None)
     slab_d = ctx_d.kv_cache.latent_rows(0)
     for j in range(8):
         live = ctx_d.page_table[0, : 33 + j]

@@ -51,27 +51,28 @@ def _tokenize_msg(uid: int) -> TokenizeMsg:
 def test_successful_tokenization_does_not_account_prompt_before_admission():
     class Tokenizer:
         def tokenize(self, messages):
-            return [torch.tensor([10, 11, 12], dtype=torch.int32)]
+            (msg,) = messages
+            return [UserMsg(uid=msg.uid, input_ids=torch.tensor([10, 11, 12], dtype=torch.int32), sampling_params=msg.sampling_params)]
 
-    ok, tensors, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
-    assert [msg.uid for msg in ok] == [1]
-    assert tensors[0].tolist() == [10, 11, 12]
+    backend, errors = _tokenize_requests(Tokenizer(), [_tokenize_msg(1)], _Logger())
+    assert [msg.uid for msg in backend] == [1]
+    assert backend[0].input_ids.tolist() == [10, 11, 12]
     assert errors == []  # in particular, no early prompt_tokens_delta UserReply
 
 
 def test_tokenization_failure_and_empty_prompt_are_terminal_without_usage():
     class Tokenizer:
         def tokenize(self, messages):
-            uid = messages[0].uid
-            if uid == 2:
+            (msg,) = messages
+            if msg.uid == 2:
                 raise ValueError("bad template")
-            return [torch.empty(0, dtype=torch.int32)]
+            return [UserMsg(uid=msg.uid, input_ids=torch.empty(0, dtype=torch.int32), sampling_params=msg.sampling_params)]
 
     logger = _Logger()
-    ok, tensors, errors = _tokenize_requests(
+    backend, errors = _tokenize_requests(
         Tokenizer(), [_tokenize_msg(2), _tokenize_msg(3)], logger
     )
-    assert ok == [] and tensors == []
+    assert backend == []
     assert [reply.uid for reply in errors] == [2, 3]
     assert all(reply.finished and reply.prompt_tokens_delta == 0 for reply in errors)
     assert "could not encode request" in errors[0].error
@@ -203,11 +204,12 @@ def test_normal_loop_sends_prior_sample_before_abort_terminal():
     scheduler.decode_manager = SimpleNamespace(runnable=False, abort_req=lambda uid: None)
     scheduler._pending_abort_acks = set()
     scheduler._pending_rebuild = None
+    scheduler._pending_flush = None
     scheduler.receive_msg = lambda blocking: [AbortBackendMsg(uid=5)]
     scheduler._schedule_next_batch = lambda: None
     sent = []
     scheduler.send_result = lambda messages: sent.append(messages)
-    late_sample = DetokenizeMsg(uid=5, next_token=99, finished=False)
+    late_sample = DetokenizeMsg(uid=5, next_tokens=[99], finished=False)
     scheduler._process_last_data = lambda _data: scheduler.send_result([late_sample])
 
     Scheduler.normal_loop(scheduler)

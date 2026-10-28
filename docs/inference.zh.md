@@ -1,5 +1,7 @@
 # 推理计算流程梳理（Inference Pipeline）
 
+> 注（2026-10-28）：本文件写于 fork 分支（`--cpu-mem` 主机预算/全局专家池那套实现）。代码已同步上游 159 个提交，`--cpu-mem` 尚未重新并入；文中相关章节暂为历史参考。
+
 承接《模型加载流程梳理》（`docs/model-loading.zh.md`）：server ready 之后，一条用户请求从
 HTTP 进入到 token 流式返回的完整计算链路。所有引用均为 `python/freetoken/` 下的 `文件:行号`，
 行号均已对照源码核验。
