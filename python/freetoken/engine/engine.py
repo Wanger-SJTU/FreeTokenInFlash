@@ -492,6 +492,9 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
+        if getattr(config, "cpu_mem_budget", None) is not None:
+            # stagger startup memory peaks: JIT first, then the pinned/spilled expert banks
+            _precompile_attention_jit(config)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -1690,6 +1693,51 @@ def _check_cpu_mem_config(config, is_moe: bool) -> None:
         "--moe-strategy offload, cpu or hybrid (got "
         f"{config.moe_strategy!r}" + ("" if is_moe else " for a dense model") + ")"
     )
+
+
+def _precompile_attention_jit(config: EngineConfig) -> None:
+    """Compile FlashInfer's prefill/decode kernels BEFORE the expert banks are loaded.
+
+    The JIT compile (nvcc + the torch extension build) is the largest transient host-RAM
+    spike of startup. Under ``--cpu-mem`` the expert banks are pinned and spilled *during*
+    the load, so letting the compile happen later (on the first prefill / graph capture)
+    stacks the two peaks and OOMs a host that just fits. Compiling first staggers them:
+    only the dense model is resident when nvcc runs. Best-effort -- any failure just leaves
+    the kernels to compile lazily as before."""
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return
+    backend = str(getattr(config, "attention_backend", "") or "").split(",")[0]
+    if backend not in ("fi", "auto"):
+        return
+    mc = config.model_config
+    try:
+        head_dim = int(mc.head_dim)
+    except (AttributeError, TypeError, ValueError):
+        return
+    if head_dim <= 0:
+        return
+    dtype = config.dtype
+    try:
+        from flashinfer.jit import gen_batch_decode_module, gen_batch_prefill_module
+
+        prefill = gen_batch_prefill_module(
+            "fa2", dtype, dtype, dtype, torch.int32, head_dim, head_dim, 0, False, False, False
+        )
+        decode = gen_batch_decode_module(dtype, dtype, dtype, torch.int32, head_dim, head_dim, 0, False, False)
+        def _compiled(spec):
+            flag = spec.is_compiled
+            return bool(flag() if callable(flag) else flag)
+
+        if not (_compiled(prefill) and _compiled(decode)):
+            logger.info_rank0(
+                "compiling the FlashInfer attention kernels before the expert banks "
+                "(staggers the JIT peak away from the pinned host banks)"
+            )
+        prefill.build_and_load()
+        decode.build_and_load()
+        logger.info_rank0("FlashInfer attention kernels ready (prefill + decode)")
+    except Exception as exc:  # noqa: BLE001 -- precompile is an optimization, never a boot failure
+        logger.warning_rank0(f"attention kernel precompile skipped ({type(exc).__name__}: {exc})")
 
 
 def _decode_target(config: EngineConfig) -> str:
