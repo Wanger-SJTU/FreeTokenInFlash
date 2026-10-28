@@ -93,6 +93,13 @@ class EngineConfig:
     # memory_ratio. CUDA graphs / activations sit on top of this budget (a post-init
     # check warns if actual usage exceeds it). Works for dense models too (KV sizing).
     gpu_mem_budget: int | None = None
+    # Host RAM budget (--cpu-mem, bytes) for the pinned expert banks (offload strategies
+    # only). Layers that don't fit are file-backed spill banks under `cpu_mem_spill_dir`
+    # and decode on the CPU executor. None = every layer pinned (the default).
+    cpu_mem_budget: int | None = None
+    # Directory for the --cpu-mem spill files (default: the model directory / the GGUF's
+    # directory). The files are unlinked immediately; their space is freed at exit.
+    cpu_mem_spill_dir: str | None = None
     # Hybrid GDN models default to the HybridRadixCache (cross-request GDN-state prefix reuse);
     # `--cache-type naive` opts out. linear_state_cache_ratio sizes the GDN snapshot cache as
     # ceil(ratio * max_running_req) extra slots.

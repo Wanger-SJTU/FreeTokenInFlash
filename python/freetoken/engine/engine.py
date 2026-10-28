@@ -767,28 +767,98 @@ class Engine:
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         check_locked_fetch_config(config)
-        # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
-        # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
-        probe = pin_probe_enabled(config, mixed_formats=layer_methods is not None) and _cpu_moe_executor_viable(config.model_config)
-        if probe:
-            from freetoken.moe.host_banks import HostResidency
+        cpu_mem = getattr(config, "cpu_mem_budget", None)
+        spill_dir = None
+        if cpu_mem is not None:
+            # --cpu-mem: an explicit host-RAM budget; over-budget layers spill to file-backed
+            # banks and decode on the CPU executor. It replaces the pin probe / pin budget
+            # entirely (the budget IS the residency plan).
+            if layer_methods is not None:
+                raise ValueError(
+                    "--cpu-mem is not supported for experts of several formats (per-format slot "
+                    "pools); serve them with --moe-strategy offload without --cpu-mem"
+                )
+            bank_bytes = _bank_bytes(config, method, layer_methods)
+            if not bank_bytes:
+                raise ValueError(
+                    "--cpu-mem: cannot estimate this checkpoint's host expert-bank bytes before "
+                    "loading; drop --cpu-mem and size the GPU cache instead"
+                )
+            from freetoken.engine.cache_budget import clamp_host_budget, host_available_bytes
 
-            requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
-            cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
+            reserve = max(0, int(os.environ.get("FREETOKEN_CPU_MEM_HEADROOM", 2 << 30)))
+            available = host_available_bytes()
+            effective = clamp_host_budget(cpu_mem, available, reserve)
+            if effective < cpu_mem:
+                logger.warning_rank0(
+                    f"--cpu-mem {cpu_mem / 2**30:.2f} GiB exceeds MemAvailable "
+                    f"{(available or 0) / 2**30:.2f} GiB minus a {reserve / 2**30:.2f} GiB "
+                    f"reserve (the runtime/JIT compile still needs RAM); clamping the pinned "
+                    f"budget to {effective / 2**30:.2f} GiB (FREETOKEN_CPU_MEM_HEADROOM adjusts "
+                    "the reserve)"
+                )
+                cpu_mem = effective
+            labels, spilled, per_layer = _cpu_mem_plan(bank_bytes, num_moe_layers, cpu_mem)
+            spill_dir = config.cpu_mem_spill_dir or (
+                os.path.dirname(config.model_path)
+                if os.path.isfile(config.model_path)
+                else config.model_path
+            )
+            requested_residency = labels
+            cpu_layer_ids = frozenset(
+                _resolve_cpu_layers(config, num_moe_layers, reserved=0, method=method) | spilled
+            )
+            probe = False
+            decode_target = config.model_config.decode_target
+            split_residency = False
+            if spilled:
+                if not _cpu_moe_executor_viable(config.model_config):
+                    raise ValueError(
+                        "--cpu-mem: the spilled layers compute experts on the CPU executor, which "
+                        "cannot serve this model's expert format/activation; raise --cpu-mem to pin "
+                        "every layer, or drop the flag"
+                    )
+                if config.moe_prefill_overlap:
+                    logger.info_rank0(
+                        "--cpu-mem: disabling MoE prefill overlap (spilled layers prefill via "
+                        "synchronous pageable copies)"
+                    )
+                    object.__setattr__(config, "moe_prefill_overlap", False)
+                pinned = num_moe_layers - len(spilled)
+                logger.info_rank0(
+                    f"--cpu-mem {cpu_mem / 2**30:.2f} GiB: pinning {pinned}/{num_moe_layers} MoE "
+                    f"layers (~{pinned * per_layer / 2**30:.2f} GiB), spilling {len(spilled)} to "
+                    f"file-backed banks under {spill_dir!r} (page-cache backed, CPU-executor decode, "
+                    f"layers {sorted(spilled)})"
+                )
+            else:
+                logger.info_rank0(
+                    f"--cpu-mem {cpu_mem / 2**30:.2f} GiB covers every MoE layer; pinning all "
+                    f"{num_moe_layers}"
+                )
         else:
-            reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
-            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
-            _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
-            decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
-            requested_residency = None
-            if split_residency:
+            # --moe-cpu-layers auto without a manual pin budget: load unpinned, then pin layers until the driver refuses (settle_banks)
+            # a model the CPU executor cannot serve takes the estimate path, which rejects it before the load when layers must lock
+            probe = pin_probe_enabled(config, mixed_formats=layer_methods is not None) and _cpu_moe_executor_viable(config.model_config)
+            if probe:
                 from freetoken.moe.host_banks import HostResidency
 
-                requested_residency = [
-                    HostResidency.LOCKED.value if i in cpu_layer_ids
-                    else HostResidency.PINNED.value
-                    for i in range(config.model_config.num_moe_layers)
-                ]
+                requested_residency = [HostResidency.DEFERRED.value] * num_moe_layers
+                cpu_layer_ids, decode_target, split_residency = frozenset(), None, False
+            else:
+                reserved = self._host_tables_bytes + staging_reserve(config, lambda: _bank_bytes(config, method, layer_methods))
+                cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=reserved, method=method)
+                _check_pin_budget(config, reserved=reserved, method=method, layer_methods=layer_methods)
+                decode_target, split_residency = self._residency_split(config, cpu_layer_ids, method, capped=_pin_budget_bytes(reserved) is not None)
+                requested_residency = None
+                if split_residency:
+                    from freetoken.moe.host_banks import HostResidency
+
+                    requested_residency = [
+                        HostResidency.LOCKED.value if i in cpu_layer_ids
+                        else HostResidency.PINNED.value
+                        for i in range(config.model_config.num_moe_layers)
+                    ]
         # read before the expert load, so a bad profile fails in seconds
         expert_counts = resolve_profile(
             config.moe_cache_split, config.model_path,
@@ -805,6 +875,7 @@ class Engine:
                     parallel=expert_parallel,
                     layer_residency=requested_residency,
                     layer_methods=layer_methods,
+                    spill_dir=spill_dir,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc
@@ -822,7 +893,10 @@ class Engine:
         if locked_fetch:
             # a locked refill costs a staged copy: place the locked pools after the pinned ones, which hold the prefill staging when they are big enough
             self._moe_pool_groups.sort(key=lambda layers: layers[0] in cpu_layer_ids)
-        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch:
+        if len(self._moe_pool_groups) > 1 and cpu_layer_ids and not locked_fetch and split_residency:
+            # LOCKED layers refill through the single pinned staging buffer, which needs one pool;
+            # --cpu-mem spill layers are PAGEABLE and prefill per pool (whole-layer sync copy), so
+            # they coexist with several pools.
             raise ValueError(
                 "several MoE slot pools (--moe-cache-scope per-layer, or experts in several quant formats) need every MoE "
                 "layer to decode from the GPU slot cache; they combine with --moe-cpu-layers only for locked layers under "
@@ -1590,11 +1664,47 @@ def _resolve_cpu_layers(config: EngineConfig, num_moe_layers: int, *, reserved: 
     return _parse_cpu_layers_spec(spec, num_moe_layers)
 
 
+def _cpu_mem_plan(bank_bytes: int, num_layers: int, budget: int) -> tuple[list[str], frozenset[int], int]:
+    """Resolve ``--cpu-mem`` into (per-layer residency labels, spilled layer ids, per-layer bytes).
+
+    The budget pins whole layers in id order and spills the rest; ``layer_bytes`` is the
+    whole-model bank estimate divided evenly over the MoE layers (the layers are symmetric
+    in every supported format)."""
+    from freetoken.engine.cache_budget import plan_host_residency
+    from freetoken.moe.host_banks import HostResidency
+
+    per_layer = -(-int(bank_bytes) // max(1, num_layers))
+    labels = plan_host_residency(num_layers, per_layer, budget)
+    spilled = frozenset(i for i, r in enumerate(labels) if r != HostResidency.PINNED.value)
+    return labels, spilled, per_layer
+
+
+def _check_cpu_mem_config(config, is_moe: bool) -> None:
+    """Reject --cpu-mem where there are no pinned expert banks to budget (dense or fused)."""
+    if getattr(config, "cpu_mem_budget", None) is None:
+        return
+    if is_moe and is_offload_moe_strategy(config.moe_strategy):
+        return
+    raise ValueError(
+        "--cpu-mem sizes the pinned expert banks, so it needs a MoE model served with "
+        "--moe-strategy offload, cpu or hybrid (got "
+        f"{config.moe_strategy!r}" + ("" if is_moe else " for a dense model") + ")"
+    )
+
+
 def _decode_target(config: EngineConfig) -> str:
-    """Where routed experts decode, from the flags alone: hybrid co-compute, the CPU executor for some or all layers, or the GPU slot cache."""
+    """Where routed experts decode, from the flags alone: hybrid co-compute, the CPU executor for some or all layers, or the GPU slot cache.
+
+    ``--cpu-mem`` spills over-budget layers to disk, so those layers decode on the CPU
+    executor (their banks have no device address); that alone forces the CPU-readable
+    (native) bank layout, exactly like an explicit CPU-layer pick."""
     if config.moe_strategy == "hybrid":
         return "hybrid"
-    if config.moe_strategy == "cpu" or (config.moe_cpu_layers and is_offload_moe_strategy(config.moe_strategy)):
+    if (
+        config.moe_strategy == "cpu"
+        or (config.moe_cpu_layers and is_offload_moe_strategy(config.moe_strategy))
+        or getattr(config, "cpu_mem_budget", None) is not None
+    ):
         return "cpu"
     return "gpu"
 
@@ -2097,6 +2207,9 @@ def _adjust_config(config: EngineConfig):
             "--moe-cpu-layers requires --moe-strategy offload or hybrid (got "
             f"{config.moe_strategy!r}); use --moe-strategy cpu to run all layers on CPU"
         )
+
+    if getattr(config, "cpu_mem_budget", None) is not None:
+        _check_cpu_mem_config(config, is_moe)
 
     if is_moe and config.moe_cpu_layers and config.moe_cpu_layers.strip() != "auto":
         if not _parse_cpu_layers_spec(config.moe_cpu_layers, model_config.num_moe_layers):

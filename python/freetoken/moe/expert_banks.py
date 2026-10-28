@@ -110,7 +110,7 @@ def build_expert_banks(
         hb = None
         banks = {role: {l: torch.empty(shape, dtype=dtype, device=device) for l in ids} for role, (shape, dtype) in specs.items()}
     else:
-        hb = {role: {l: HostBank(shape, dtype) for l in ids} for role, (shape, dtype) in specs.items()}
+        hb = {role: {l: HostBank(shape, dtype, layer_id=l) for l in ids} for role, (shape, dtype) in specs.items()}
         banks = {role: {l: b.tensor for l, b in per_layer.items()} for role, per_layer in hb.items()}
     alphas = {
         role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
@@ -337,6 +337,7 @@ def load_expert_banks(
     layer_residency: list[str] | None = None,
     resident: bool = False,
     layer_methods: list | None = None,
+    spill_dir: str | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -362,6 +363,10 @@ def load_expert_banks(
     ``layer_residency``: per-layer ``HostResidency`` labels applied at settle time -- explicitly on the FTW fast path, ambiently (``requested_residency``) in the slow-path providers.
     Applied labels are echoed on ``ExpertBanks.layer_residency``; a loader that settles some other way leaves it ``None`` (CPU-layer decode still works on pinned banks, it just saves no pin quota).
 
+    ``spill_dir`` (``--cpu-mem``): PAGEABLE layers allocate their banks over an unlinked
+    spill tmpfile in that directory and drop the filled pages, so their RAM is the page
+    cache's to reclaim instead of pinned/committed anonymous memory.
+
     ``resident`` (with ``method``): the banks land on ``device`` for the resident 'fused' experts; no host bank outlives the load.
 
     ``layer_methods`` (one bound method per MoE layer) serves experts of several formats: each
@@ -380,7 +385,7 @@ def load_expert_banks(
         else:
             banks = load_ftw_banks(
                 model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-                layer_residency=layer_residency,
+                layer_residency=layer_residency, spill_dir=spill_dir,
             )
         if banks is not None:
             logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
@@ -428,7 +433,7 @@ def load_expert_banks(
             raise ValueError("the experts of a raw checkpoint are packed by the offload layers' MoE quant method; pass method=")
         return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink, resident)
 
-    with requested_residency(layer_residency) as residency_plan:
+    with requested_residency(layer_residency, spill_dir=spill_dir) as residency_plan:
         try:
             banks = _build(parallel)
         except NotImplementedError as exc:

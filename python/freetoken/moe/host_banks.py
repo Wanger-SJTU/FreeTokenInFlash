@@ -24,6 +24,7 @@ import mmap
 import os
 import queue
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
@@ -109,22 +110,29 @@ class HostBank:
 
     * ``"mmap"`` (default) -- lazy anonymous mmap; pages materialize on fill, then ``pin()`` registers or ``lock()`` OS-locks it.
     * ``"cuda"`` -- cudaHostAlloc, born pinned+mapped; ``pin()``/``lock()``/``release()`` are no-ops and it never takes LOCKED. See :func:`born_pinned_default`.
+    * ``"file"`` -- shared mmap over an unlinked spill tmpfile (``--cpu-mem``'s over-budget layers): never pinned, and :meth:`drop_pages` returns the filled pages to the OS / page cache, so resident RAM tracks the page cache instead of the bank size. Later reads re-fault from the file.
 
-    The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
+    The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows the ambient :func:`requested_residency` plan (a PAGEABLE layer under a ``--cpu-mem`` spill dir becomes file-backed) and then ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_file_backed")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
-                 *, backing: str | None = None):
+                 *, backing: str | None = None, layer_id: int | None = None):
+        plan = _requested_residency
+        spill_dir = plan.spill_dir if plan is not None else None
         if backing is None:
-            plan = _requested_residency
             # a plan with non-pinned labels vetoes born-pinned: cudaHostAlloc spends the pin quota the plan exists to save
             born = _env_born_pinned() and (plan is None or not plan.has_unpinned)
-            backing = "cuda" if born else "mmap"
-        assert backing in ("mmap", "cuda"), backing
+            spill = plan.spill_for(layer_id) if plan is not None else None
+            if spill is not None:
+                backing = "file"
+            else:
+                backing = "cuda" if born else "mmap"
+        assert backing in ("mmap", "cuda", "file"), backing
         elsize = torch.empty((), dtype=dtype).element_size()
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
+        self._file_backed = backing == "file"
         if backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -137,6 +145,11 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+        elif backing == "file":
+            self._buf = _mmap_spill_tmpfile(asize, spill_dir)
+            _LIVE_BUFFERS.append(self._buf)
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
+            self._pinned = False
         else:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
@@ -160,6 +173,10 @@ class HostBank:
         """cudaHostRegister the (now-filled) buffer -- pin-after-fill.
 
         ``FREETOKEN_SKIP_BANK_PIN=1`` makes this a no-op for CPU-only tooling (the FTW converter); never set it when serving, the GPU paths need registered banks."""
+        assert not self._file_backed, (
+            "file-backed (--cpu-mem spill) banks are never pinned: the GPU cannot dereference "
+            "them and pinning would defeat the RAM budget"
+        )
         if self._pinned:
             return
         if os.environ.get("FREETOKEN_SKIP_BANK_PIN", "").strip().lower() in ("1", "true", "yes", "on"):
@@ -191,6 +208,15 @@ class HostBank:
         if self._pinned:
             return
         self._buf.madvise(mmap.MADV_DONTNEED)
+
+    def drop_pages(self) -> None:
+        """Return a file-backed bank's resident pages to the OS (``--cpu-mem`` spill layers).
+
+        The filled bytes live in the unlinked spill tmpfile, so a later access faults the same
+        data back from the page cache / disk. No-op for anonymous banks: their pages have no
+        backing store, dropping them would lose the data."""
+        if self._file_backed:
+            self._buf.madvise(mmap.MADV_DONTNEED)
 
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but with no device address, so the GPU cannot gather its rows.
@@ -245,24 +271,52 @@ def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[s
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
 
 
+def _mmap_spill_tmpfile(asize: int, spill_dir: str | None) -> mmap.mmap:
+    """Shared mmap over an unlinked spill tmpfile: pages the kernel drops are re-faulted from
+    the file, so a bank caps at the page cache instead of pinned/committed anonymous RAM.
+
+    Unlinking immediately hands the space back at process exit; the mapping itself keeps the
+    storage alive (POSIX semantics). Linux-only: MADV_DONTNEED must drop, not discard."""
+    if sys.platform != "linux":
+        raise NotImplementedError(
+            "--cpu-mem spill banks are Linux-only (MADV_DONTNEED on a shared file mapping; "
+            "other platforms discard unsaved pages)"
+        )
+    fd, path = tempfile.mkstemp(prefix="freetoken_expert_", suffix=".spill", dir=spill_dir)
+    try:
+        os.ftruncate(fd, asize)
+        buf = mmap.mmap(fd, asize, flags=mmap.MAP_SHARED)
+    finally:
+        os.close(fd)
+        os.unlink(path)  # storage survives until the mapping closes (process lifetime)
+    return buf
+
+
 class _ResidencyPlan:
     """Per-layer ``HostResidency`` labels, ambiently visible to the bank settle points.
 
-    Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan."""
+    Installed by ``load_expert_banks`` around the provider dispatch so every loader honors --moe-cpu-layers without a new parameter in each signature. ``applied`` flips once a settle point consults the plan. ``spill_dir`` (``--cpu-mem``) makes PAGEABLE layers allocate file-backed banks; ``None`` keeps the plain anonymous mmap."""
 
-    __slots__ = ("labels", "applied", "has_unpinned", "actual", "deferred")
+    __slots__ = ("labels", "applied", "has_unpinned", "actual", "deferred", "spill_dir")
 
-    def __init__(self, labels: list[str]):
+    def __init__(self, labels: list[str], spill_dir: str | None = None):
         self.labels = list(labels)
         self.applied = False
         self.has_unpinned = any(r != HostResidency.PINNED.value for r in labels)
         self.actual: dict[int, str] = {}
         # DEFERRED layers' filled banks, for probe_pin
         self.deferred: dict[int, list[HostBank]] = {}
+        self.spill_dir = spill_dir
 
     def residency_for(self, layer_id: int) -> str:
         self.applied = True
         return self.labels[layer_id]
+
+    def spill_for(self, layer_id: int | None) -> str | None:
+        """The spill directory a bank of ``layer_id`` should be file-backed in, or None (anonymous)."""
+        if self.spill_dir is None or layer_id is None or not 0 <= layer_id < len(self.labels):
+            return None
+        return self.spill_dir if self.labels[layer_id] == HostResidency.PAGEABLE.value else None
 
     def record(self, layer_id: int, achieved: str) -> None:
         """One pageable bank downgrades the whole layer (a failed lock settles PAGEABLE)."""
@@ -274,13 +328,13 @@ _requested_residency: _ResidencyPlan | None = None
 
 
 @contextlib.contextmanager
-def requested_residency(labels: list[str] | None):
-    """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins)."""
+def requested_residency(labels: list[str] | None, spill_dir: str | None = None):
+    """Install the ambient per-layer residency plan for the enclosed bank load (``None`` = no plan, everything pins). ``spill_dir`` makes PAGEABLE layers file-backed (``--cpu-mem``)."""
     global _requested_residency
     if labels is None:
         yield None
         return
-    plan = _ResidencyPlan(labels)
+    plan = _ResidencyPlan(labels, spill_dir=spill_dir)
     prev, _requested_residency = _requested_residency, plan
     try:
         yield plan
@@ -288,12 +342,46 @@ def requested_residency(labels: list[str] | None):
         _requested_residency = prev
 
 
+# --cpu-mem spill fill writes dirty page cache faster than one NVMe can write it back
+# while the same disk is still being read from; reclaim failing on the pileup ends in a
+# global OOM kill. _await_writeback_drain blocks the settle thread until Dirty shrinks
+# below the limit, and the bounded PinPipeline queue turns that into reader backpressure.
+_SPILL_DIRTY_LIMIT = int(os.getenv("FREETOKEN_SPILL_DIRTY_LIMIT", 1 << 30))  # bytes
+
+
+def _dirty_bytes() -> int | None:
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("Dirty:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, StopIteration, ValueError):
+        pass
+    return None
+
+
+def _await_writeback_drain(limit: int = _SPILL_DIRTY_LIMIT, timeout_s: float = 300.0) -> None:
+    """Wait until the kernel's Dirty page count is under ``limit`` (no-op off Linux)."""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        dirty = _dirty_bytes()
+        if dirty is None or dirty <= limit:
+            return
+        time.sleep(0.05)
+
+
 def _settle(bank: HostBank, residency: str) -> None:
-    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap)."""
+    """Route a filled bank to its residency class (PAGEABLE = leave the plain mmap, or drop a file-backed bank's pages)."""
     if residency == HostResidency.PINNED.value:
         bank.pin()
     elif residency == HostResidency.LOCKED.value:
         bank.lock()
+    elif residency == HostResidency.PAGEABLE.value:
+        if bank._file_backed:
+            _await_writeback_drain()  # the dropped pages turn into writeback; keep Dirty bounded
+        bank.drop_pages()
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]]) -> None:
@@ -380,8 +468,14 @@ class PinPipeline:
     A clean context-manager exit drains the queue and re-raises the first settle failure.
     """
 
-    def __init__(self) -> None:
-        self._q: queue.SimpleQueue = queue.SimpleQueue()
+    def __init__(self, bounded: bool | None = None) -> None:
+        # a spill plan's settle thread waits on writeback; a bounded queue propagates that
+        # backpressure to the readers instead of letting dirty page cache run ahead.
+        # ``bounded=None`` takes it from the ambient plan; the FTW fast path passes it explicitly.
+        plan = _requested_residency
+        if bounded is None:
+            bounded = plan is not None and plan.spill_dir is not None
+        self._q: queue.Queue = queue.Queue(maxsize=4) if bounded else queue.Queue()
         self._exc: BaseException | None = None
         # the current device is thread-local: a fresh thread sits on device 0 and cudaHostRegister would build its context there -- carry the creator's (bound) device into the worker
         self._device = torch.cuda.current_device() if torch.cuda.is_available() else None

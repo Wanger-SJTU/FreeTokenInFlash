@@ -378,6 +378,32 @@ def parse_args(
         ),
     )
 
+    parser.add_argument(
+        "--cpu-mem",
+        dest="cpu_mem_budget",
+        type=_parse_mem_size,
+        default=ServerArgs.cpu_mem_budget,
+        metavar="SIZE",
+        help=(
+            "Host RAM budget for the PINNED expert banks (e.g. 10GiB). MoE offload "
+            "strategies only. Layers that don't fit the budget spill to file-backed banks "
+            "(unlinked files under --cpu-mem-spill-dir; the OS page cache pages them in on "
+            "demand) and decode on the CPU executor, so a checkpoint whose experts exceed "
+            "host RAM can still be served. Unset = pin every layer."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-mem-spill-dir",
+        dest="cpu_mem_spill_dir",
+        type=str,
+        default=ServerArgs.cpu_mem_spill_dir,
+        metavar="DIR",
+        help=(
+            "Directory for the --cpu-mem spill files (default: the model directory). The "
+            "files are unlinked immediately their space is returned when the server exits."
+        ),
+    )
+
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",

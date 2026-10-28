@@ -95,9 +95,9 @@ def load_gguf_expert_banks(model_path: str, num_layers: int, *, first_layer: int
             gate_up_shape = (rows[0].shape[0], sum(r.shape[1] for r in rows), rows[0].shape[2])
             experts = rows[0].shape[0]
             if device is None:
-                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype), "down": HostBank(tuple(d.shape), d.dtype)}
+                host = {"gate_up": HostBank(gate_up_shape, rows[0].dtype, layer_id=layer), "down": HostBank(tuple(d.shape), d.dtype, layer_id=layer)}
                 if scaled:
-                    host["global"] = HostBank((experts, 4), torch.float32)
+                    host["global"] = HostBank((experts, 4), torch.float32, layer_id=layer)
                 banks = {role: bank.tensor for role, bank in host.items()}
             else:
                 banks = {

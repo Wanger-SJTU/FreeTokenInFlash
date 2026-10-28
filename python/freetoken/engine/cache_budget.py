@@ -63,6 +63,52 @@ def absolute_pool_budget_bytes(gpu_budget: int, consumed_bytes: int) -> int:
     return int(gpu_budget) - int(consumed_bytes)
 
 
+def host_available_bytes() -> int | None:
+    """/proc/meminfo MemAvailable (reclaimable page cache included), or None when
+    unreadable (non-Linux)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, StopIteration):
+        pass
+    return None
+
+
+def clamp_host_budget(budget_bytes: int, available: int | None, reserve: int) -> int:
+    """Cap a --cpu-mem budget at ``MemAvailable - reserve``.
+
+    The pinned banks are unreclaimable, while the rest of the process (dense weights,
+    torch/CUDA runtime, a one-off FlashInfer/Triton JIT compile) still needs RAM on top;
+    spending the whole available memory pins the box into swap before serving starts."""
+    if available is None:
+        return int(budget_bytes)
+    return max(0, min(int(budget_bytes), int(available) - int(reserve)))
+
+
+def plan_host_residency(
+    num_layers: int, layer_bytes: int, budget_bytes: int | None
+) -> list[str]:
+    """Greedy per-layer host residency plan for --cpu-mem: pin layers in id order until
+    the budget is exhausted, then spill the rest to file-backed (page-cache-paged) banks.
+
+    Returns ``HostResidency``-compatible values ("pinned"/"pageable"); ``budget_bytes``
+    None (unset) pins everything. ``layer_bytes <= 0`` (unknown geometry) also pins
+    everything: an unmeasurable budget must not silently spill."""
+    if budget_bytes is None or layer_bytes <= 0:
+        return ["pinned"] * num_layers
+    plan = []
+    remaining = int(budget_bytes)
+    for _ in range(num_layers):
+        if remaining >= layer_bytes:
+            plan.append("pinned")
+            remaining -= layer_bytes
+        else:
+            plan.append("pageable")
+    return plan
+
+
 def required_bytes(
     moe_cache_size: int, num_pages: int, per_expert_bytes: int, cache_per_page: int
 ) -> int:

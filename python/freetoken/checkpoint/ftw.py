@@ -489,7 +489,7 @@ def _split_bank_entries(reader: FTWReader, path: str, num_layers: int):
 
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
-    layer_residency: list[str] | None = None,
+    layer_residency: list[str] | None = None, spill_dir: str | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
@@ -534,6 +534,8 @@ def load_ftw_banks(
     def _backing(layer_id: int) -> str:
         if born and residency[layer_id] == HostResidency.PINNED.value:
             return "cuda"
+        if spill_dir is not None and residency[layer_id] == HostResidency.PAGEABLE.value:
+            return "file"
         return "mmap"
 
     reader = FTWReader(path)
@@ -603,7 +605,7 @@ def load_ftw_banks(
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
     n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs)
     try:
-        with PinPipeline() as pins:
+        with PinPipeline(bounded=spill_dir is not None) as pins:
 
             def _read_alpha(e):
                 bank = alpha_hb[e["name"]]
