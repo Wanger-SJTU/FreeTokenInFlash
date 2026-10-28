@@ -9,20 +9,30 @@ import torch
 
 from freetoken.layers.quantization.ggml_types import NVFP4, is_quantized, pad_rows, scale_name, segment_param, segments
 
-from .reader import GgufTensorInfo, gguf_tensor_index
+from .reader import GgufTensorInfo, byte_view, gguf_direct_reader, gguf_tensor_index
 
 _FLOAT_DTYPES = {0: torch.float32, 1: torch.float16, 30: torch.bfloat16}
 
 
+def _read_tensor(info: GgufTensorInfo) -> torch.Tensor:
+    """The tensor's packed bytes in a fresh contiguous uint8 tensor, read with O_DIRECT.
+
+    No mmap: mapping the checkpoint would leave its bytes in the page cache, which is the
+    one thing a RAM-tight ``--cpu-mem`` host cannot spare (see GgufDirectReader)."""
+    buf = torch.empty(info.nbytes, dtype=torch.uint8)
+    gguf_direct_reader(info.path).read_into(byte_view(buf), info.offset, info.nbytes)
+    return buf
+
+
 def float_tensor(info: GgufTensorInfo) -> torch.Tensor:
     """A float tensor in torch order (ggml dims reversed)."""
-    return torch.from_numpy(np.array(info.data())).view(_FLOAT_DTYPES[info.ggml_type]).view(*reversed(info.ne))
+    return _read_tensor(info).view(_FLOAT_DTYPES[info.ggml_type]).view(*reversed(info.ne))
 
 
 def packed_rows(info: GgufTensorInfo) -> torch.Tensor:
     """Packed ggml rows ``[rows, row_bytes]`` of a quantized tensor."""
     rows = int(np.prod(info.ne[1:]))
-    return torch.from_numpy(info.data()).view(rows, info.nbytes // rows)
+    return _read_tensor(info).view(rows, info.nbytes // rows)
 
 
 def matrix(info: GgufTensorInfo) -> torch.Tensor:

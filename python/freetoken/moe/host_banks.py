@@ -114,7 +114,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows the ambient :func:`requested_residency` plan (a PAGEABLE layer under a ``--cpu-mem`` spill dir becomes file-backed) and then ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_file_backed")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_file_backed", "_spill_fd")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None, layer_id: int | None = None):
@@ -133,6 +133,7 @@ class HostBank:
         self.nbytes = math.prod(shape) * elsize
         asize = ((self.nbytes + _BLK - 1) // _BLK) * _BLK
         self._file_backed = backing == "file"
+        self._spill_fd = None
         if backing == "cuda":
             from freetoken.kernel.pinned import alloc_pinned_tensor
 
@@ -146,7 +147,7 @@ class HostBank:
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         elif backing == "file":
-            self._buf = _mmap_spill_tmpfile(asize, spill_dir)
+            self._buf, self._spill_fd = _mmap_spill_tmpfile(asize, spill_dir)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
@@ -218,6 +219,25 @@ class HostBank:
         if self._file_backed:
             self._buf.madvise(mmap.MADV_DONTNEED)
 
+    def drop_cache(self) -> None:
+        """Flush a file-backed bank to its spill file and drop its page-cache pages.
+
+        ``MADV_DONTNEED`` only unmaps our own PTEs; the data stays in the page cache until
+        the kernel evicts it. Writing the (dirty) pages back and dropping the file cache
+        makes the spill's RAM footprint zero right after the fill instead of waiting for
+        reclaim pressure -- on a host that only just fits the banks, that is the difference
+        between "the page cache absorbs it" and an OOM."""
+        if not self._file_backed or self._spill_fd is None:
+            return
+        try:
+            os.fsync(self._spill_fd)
+        except OSError:
+            return
+        try:
+            os.posix_fadvise(self._spill_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
+
     def lock(self) -> None:
         """mlock the (now-filled) buffer: resident without CUDA pin quota, but with no device address, so the GPU cannot gather its rows.
 
@@ -271,12 +291,14 @@ def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[s
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
 
 
-def _mmap_spill_tmpfile(asize: int, spill_dir: str | None) -> mmap.mmap:
+def _mmap_spill_tmpfile(asize: int, spill_dir: str | None) -> tuple[mmap.mmap, int]:
     """Shared mmap over an unlinked spill tmpfile: pages the kernel drops are re-faulted from
     the file, so a bank caps at the page cache instead of pinned/committed anonymous RAM.
 
-    Unlinking immediately hands the space back at process exit; the mapping itself keeps the
-    storage alive (POSIX semantics). Linux-only: MADV_DONTNEED must drop, not discard."""
+    Returns the mapping and the (still open) file descriptor: ``drop_cache`` needs it to
+    force writeback and drop the file's page-cache pages. Unlinking immediately hands the
+    space back at process exit; the mapping keeps the storage alive (POSIX semantics).
+    Linux-only: MADV_DONTNEED must drop, not discard."""
     if sys.platform != "linux":
         raise NotImplementedError(
             "--cpu-mem spill banks are Linux-only (MADV_DONTNEED on a shared file mapping; "
@@ -286,10 +308,12 @@ def _mmap_spill_tmpfile(asize: int, spill_dir: str | None) -> mmap.mmap:
     try:
         os.ftruncate(fd, asize)
         buf = mmap.mmap(fd, asize, flags=mmap.MAP_SHARED)
-    finally:
+    except BaseException:
         os.close(fd)
-        os.unlink(path)  # storage survives until the mapping closes (process lifetime)
-    return buf
+        os.unlink(path)
+        raise
+    os.unlink(path)  # storage survives through the open fd / mapping (process lifetime)
+    return buf, fd
 
 
 class _ResidencyPlan:
@@ -382,6 +406,7 @@ def _settle(bank: HostBank, residency: str) -> None:
         if bank._file_backed:
             _await_writeback_drain()  # the dropped pages turn into writeback; keep Dirty bounded
         bank.drop_pages()
+        bank.drop_cache()
 
 
 def pin_banks(banks: dict[str, HostBank | list[HostBank] | dict[int, HostBank]]) -> None:

@@ -9,6 +9,8 @@ packed bytes sit in the memory-mapped file).
 from __future__ import annotations
 
 import functools
+import logging
+import mmap
 import os
 import re
 import struct
@@ -16,6 +18,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import torch
+
+logger = logging.getLogger(__name__)
+
+# O_DIRECT block alignment (the filesystem's logical block size; 4096 is the safe floor for
+# the page-aligned bounce buffer and the aligned read windows below).
+_DIRECT_BLK = 4096
+_DIRECT_CHUNK = 8 << 20
 
 
 def is_gguf_path(model_path: str) -> bool:
@@ -135,6 +145,97 @@ def gguf_split_paths(model_path: str) -> tuple[str, ...]:
     if missing:
         raise FileNotFoundError(f"GGUF split files missing: {missing}")
     return paths
+
+
+class GgufDirectReader:
+    """Chunked O_DIRECT reads of one GGUF file, leaving no page cache behind.
+
+    mmap-reading an 18 GiB expert set fills several GiB of page cache, which competes with
+    the pinned expert banks on a RAM-tight host. O_DIRECT DMAs straight into our buffer
+    instead. ``read_into`` hides the alignment rules: it reads the block-aligned enclosing
+    window through a page-aligned bounce buffer and copies the exact bytes out, so an
+    unaligned tensor offset/length and any destination buffer work. When the filesystem
+    rejects O_DIRECT (tmpfs, some overlay/network mounts) it falls back to buffered
+    ``preadv`` -- still no mmap of the whole file."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._direct = getattr(os, "O_DIRECT", 0)
+        self._fd: int | None = None
+        self._bounce: mmap.mmap | None = None
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+    def _file(self) -> int:
+        if self._fd is not None:
+            return self._fd
+        try:
+            fd = os.open(self.path, os.O_RDONLY | self._direct)
+        except OSError:
+            if not self._direct:
+                raise
+            logger.warning("O_DIRECT unsupported on %s; using buffered reads", self.path)
+            self._direct = 0
+            fd = os.open(self.path, os.O_RDONLY)
+        self._fd = fd
+        return fd
+
+    def read_into(self, mv: memoryview, offset: int, nbytes: int) -> None:
+        """Fill ``mv[:nbytes]`` with the file bytes at ``offset``."""
+        if nbytes <= 0:
+            return
+        if len(mv) < nbytes:
+            raise ValueError(f"destination {len(mv)} B < {nbytes} B read")
+        fd = self._file()
+        if not self._direct:
+            done = 0
+            while done < nbytes:
+                n = os.preadv(fd, [mv[done:]], offset + done)
+                if n == 0:
+                    raise OSError(f"unexpected EOF at {offset + done}: {done}/{nbytes} B of {self.path}")
+                done += n
+            return
+        if self._bounce is None:
+            self._bounce = mmap.mmap(-1, _DIRECT_CHUNK)  # page-aligned
+        bounce = self._bounce
+        bmv = memoryview(bounce)
+        start = offset - offset % _DIRECT_BLK
+        end = offset + nbytes
+        win_end = (end + _DIRECT_BLK - 1) // _DIRECT_BLK * _DIRECT_BLK
+        cur = start
+        while cur < win_end:
+            n = min(_DIRECT_CHUNK, win_end - cur)  # both multiples of the block size
+            got = 0
+            while got < n:
+                r = os.preadv(fd, [bmv[got:n]], cur + got)
+                if r == 0:
+                    break
+                got += r
+                if got % _DIRECT_BLK:  # a partial block: cannot continue O_DIRECT in place
+                    break
+            lo = max(cur, offset)
+            hi = min(cur + got, end)
+            if hi > lo:
+                mv[lo - offset : hi - offset] = bmv[lo - cur : hi - cur]
+            if got < n:
+                if cur + got >= end:
+                    return  # the shortfall is only the aligned tail
+                raise OSError(f"short O_DIRECT read at {cur + got} ({got}/{n} B) of {self.path}")
+            cur += n
+
+
+def byte_view(t) -> memoryview:
+    """A 1-D writable byte view of a contiguous CPU tensor (bf16/f16 have no numpy dtype)."""
+    return memoryview(t.reshape(-1).view(torch.uint8).numpy())
+
+
+@functools.cache
+def gguf_direct_reader(path: str) -> GgufDirectReader:
+    """The (cached) O_DIRECT reader of one GGUF split file."""
+    return GgufDirectReader(path)
 
 
 @dataclass(frozen=True)
