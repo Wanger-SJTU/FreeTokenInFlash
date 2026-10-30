@@ -14,6 +14,7 @@ Commands:
   shell       Chat with a FreeToken server in the terminal
   ctl         Query and manage a running FreeToken server
   daemon      Run the FreeToken supervisor (persistent engine service)
+  jit         Compile the AOT kernels a checkpoint needs (weights are not loaded)
   launch      Configure and launch an agent against a FreeToken server
   checkpoint  Convert an HF safetensors checkpoint to FTW
   bench       Run a micro-benchmark (e.g. "bench bw" = CPU vs PCIe bandwidth)
@@ -53,6 +54,12 @@ def _run_ctl(argv: list[str]) -> int:
     from freetoken.control_cli import main
 
     return main(argv, prog="ft ctl")
+
+
+def _run_jit(argv: list[str]) -> int:
+    from freetoken.jit import main
+
+    return main(argv, prog="ft jit")
 
 
 def _run_daemon(argv: list[str]) -> int:
@@ -98,6 +105,7 @@ COMMANDS = {
     "launch": "_run_launch",
     "checkpoint": "_run_checkpoint",
     "bench": "_run_bench",
+    "jit": "_run_jit",
 }
 
 

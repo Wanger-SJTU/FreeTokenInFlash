@@ -12,6 +12,7 @@ ft <command> [args]
 | `ft launch` | Configure and launch a coding agent against a server |
 | `ft checkpoint` | Convert an HF checkpoint to the FTW fast-load format |
 | `ft bench bw` | Benchmark CPU vs PCIe bandwidth to calibrate hybrid MoE decode |
+| `ft jit` | Compile the AOT kernels a checkpoint needs (weights are not loaded) |
 
 `ft --version` prints the installed version (torch-free; nightly wheels carry a
 `+g<sha>` build stamp, tagged releases a bare version). Every command supports
@@ -201,6 +202,22 @@ strategies alike (DeepSeek-V4 experts serve offload only);
 `--moe-backend` is kept for compatibility. See the FTW caveats in
 [models.md](models.md#notes); FTW files from older builds can be repaired with
 [scripts/ftw_hotfix.py](ftw-hotfix.md) instead of reconverting.
+
+## ft jit
+
+```bash
+ft jit --model <path> [--attention-backend NAME] [--dtype auto|bfloat16|float16|float32] [--tp-size N]
+```
+
+Compiles the AOT kernels this checkpoint's forward path needs: the ggml-CUDA module for
+GGUF dense/experts and the FlashInfer attention modules. **Model weights are not loaded**
+- only the GGUF metadata / `config.json` is read, so a 20 GB checkpoint costs ~1.7 GB RSS.
+
+Without a prebuilt kernel cache these modules are nvcc-built on first use (ggml takes a
+few minutes and several GiB of host RAM). Building them inside `ft serve` stacks the
+build on top of the pinned/spilled expert banks; on a RAM-tight host (`--cpu-mem`) the
+first request then dies. Run `ft jit` once ahead of time on a machine with spare memory;
+`ft serve` then loads the cached modules (no compile).
 
 ## ft bench bw
 

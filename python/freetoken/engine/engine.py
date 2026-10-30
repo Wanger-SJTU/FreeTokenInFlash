@@ -492,9 +492,9 @@ class Engine:
         if hasattr(self.model, "load_host_tables"):
             with _weight_load_context():
                 self._host_tables_bytes += int(self.model.load_host_tables(config) or 0)
-        if getattr(config, "cpu_mem_budget", None) is not None:
+        if getattr(config, "cpu_mem_budget", None) is not None or _env_truthy("FREETOKEN_PRECOMPILE"):
             # stagger startup memory peaks: JIT first, then the pinned/spilled expert banks
-            _precompile_attention_jit(config)
+            _precompile_kernels(config)
         if is_offload_moe_strategy(config.moe_strategy):
             self._init_offload_moe_cache(config)
         if hasattr(self.model, "prepare_for_runtime"):
@@ -607,9 +607,9 @@ class Engine:
             out_dtype=torch.float32,
             linear_backend=self.linear_backend,
         )
-        if config.attention_backend.split(",")[0] == "triton":
-            # Prefill runs on the first comma part; warm its autotune cache.
-            self._warmup_prefill()
+        # Warm the prefill and decode paths independently: the first user request must not
+        # pay the first-use JIT/allocation of either (see _warmup_forward_paths).
+        self._warmup_forward_paths()
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1401,65 +1401,124 @@ class Engine:
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
 
     @torch.inference_mode()
-    def _warmup_prefill(self) -> None:
-        """Compile the Triton prefill path before the first real request.
+    def _warmup_forward_paths(self) -> None:
+        """Compile/allocate the prefill and decode paths separately before serving.
 
-        Decode CUDA graph capture warms the decode path, but the first prefill
-        can still pay Triton/cublas setup costs. Use the dummy request row and
-        restore it afterwards so padded decode graph replay keeps using the
-        dedicated dummy KV slot.
+        ``_precompile_kernels`` loads the AOT modules ahead of the expert banks, but the
+        forward paths still own lazy state: per-shape index-copy/gather kernels, the
+        sampler, the CPU executor's pinned IO and host nodes, ggml/Triton per-path
+        autotune. Exercising them here means the first user request never pays for it --
+        on a ``--cpu-mem`` host that first request is otherwise the largest single memory
+        spike of the run, on top of the resident banks.
+
+        Prefill is warm only through the chunked-prefill shape the scheduler uses: the
+        dummy prompt is split into ``--max-prefill-length`` chunks, each forwarded as its
+        own batch with ``cached_len`` advancing, so a small chunk budget also warms the
+        continuation (chunk N>0) path. Decode is warmed only when CUDA graphs did not
+        already run one (capture warms it, an eager warmup does not).
         """
+        backend = str(getattr(self.config, "attention_backend", "") or "").split(",")[0]
+        cpu_mem = getattr(self.config, "cpu_mem_budget", None) is not None
+        if not (backend == "triton" or cpu_mem or _env_truthy("FREETOKEN_WARMUP")):
+            return
         if self.max_seq_len < 2:
             return
-
-        warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
-            warmup_lens.append(128)
-        warmup_lens = sorted({length for length in warmup_lens if length >= 2})
-        if not warmup_lens:
-            return
-
-        dummy_row = self.page_table[self.dummy_req.table_idx]
-        dummy_slot = int(dummy_row[0].item())
+        reason = (
+            "triton autotune" if backend == "triton"
+            else "--cpu-mem" if cpu_mem
+            else "FREETOKEN_WARMUP"
+        )
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)
         try:
-            for length in warmup_lens:
-                dummy_row[:length] = torch.arange(
-                    length, dtype=torch.int32, device=self.device
-                )
-                warm_req = Req(
-                    input_ids=torch.zeros(length, dtype=torch.int32, device="cpu"),
-                    table_idx=self.dummy_req.table_idx,
-                    cached_len=0,
-                    output_len=1,
-                    uid=-1,
-                    sampling_params=None,  # type: ignore[arg-type]
-                    cache_handle=None,  # type: ignore[arg-type]
-                )
-                batch = Batch(reqs=[warm_req], phase="prefill")
-                batch.padded_reqs = batch.reqs
-                batch.input_ids = torch.zeros(length, dtype=torch.int32, device=self.device)
-                batch.positions = torch.arange(length, dtype=torch.int32, device=self.device)
-                if self.config.model_config.model_is_mrope:
-                    batch.mrope_positions = (
-                        batch.positions.unsqueeze(0).expand(3, -1).contiguous()
-                    )
-                batch.out_loc = dummy_row[:length]
-                self.attn_backend.prepare_metadata(batch)
-                with self.ctx.forward_batch(batch):
-                    self.model.forward()
+            lengths = self._warmup_prefill_chunked()
+            decode = self._warmup_decode()
         finally:
-            dummy_row.fill_(dummy_slot)
             if self.moe_offload_cache is not None:
                 self.moe_offload_cache.reset()
+            torch.cuda.synchronize(self.device)
         ended.record(self.stream)
         torch.cuda.synchronize(self.device)
         logger.info_rank0(
-            f"Prefill warmup complete for lengths {warmup_lens} "
+            f"Forward-path warmup ({reason}): chunked prefill {lengths}, "
+            f"decode {'warmed' if decode else 'already warmed by CUDA graphs'} "
             f"in {started.elapsed_time(ended) / 1000.0:.3f} s"
         )
+
+    def _warmup_prefill_chunked(self) -> list[int]:
+        """Forward the dummy prefill in ``--max-prefill-length`` chunks; returns the lengths."""
+        chunk = getattr(self.config, "max_extend_tokens", 8192) or self.max_seq_len
+        chunk = max(2, min(int(chunk), self.max_seq_len))
+        warmup_lens = sorted({min(80, self.max_seq_len), min(128, self.max_seq_len)})
+        warmup_lens = [n for n in warmup_lens if n >= 2]
+        dummy_row = self.page_table[self.dummy_req.table_idx]
+        dummy_slot = int(dummy_row[0].item())
+        try:
+            for length in warmup_lens:
+                dummy_row[:length] = torch.arange(length, dtype=torch.int32, device=self.device)
+                for start in range(0, length, chunk):
+                    n = min(chunk, length - start)
+                    # the prompt "grows" per chunk so cached_len+extend_len stays consistent
+                    warm_req = Req(
+                        input_ids=torch.zeros(start + n, dtype=torch.int32, device="cpu"),
+                        table_idx=self.dummy_req.table_idx,
+                        cached_len=start,
+                        output_len=1,
+                        uid=-1,
+                        sampling_params=None,  # type: ignore[arg-type]
+                        cache_handle=None,  # type: ignore[arg-type]
+                    )
+                    batch = Batch(reqs=[warm_req], phase="prefill")
+                    batch.padded_reqs = batch.reqs
+                    batch.input_ids = torch.zeros(n, dtype=torch.int32, device=self.device)
+                    batch.positions = torch.arange(
+                        start, start + n, dtype=torch.int32, device=self.device
+                    )
+                    batch.out_loc = dummy_row[start : start + n]
+                    if self.config.model_config.model_is_mrope:
+                        batch.mrope_positions = (
+                            batch.positions.unsqueeze(0).expand(3, -1).contiguous()
+                        )
+                    self.attn_backend.prepare_metadata(batch)
+                    with self.ctx.forward_batch(batch):
+                        self.model.forward()
+        finally:
+            dummy_row.fill_(dummy_slot)
+        return warmup_lens
+
+    def _warmup_decode(self) -> bool:
+        """One eager decode forward; False when CUDA graph capture already ran one."""
+        if getattr(self.graph_runner, "graph_bs_list", []):
+            return False
+        dummy_row = self.page_table[self.dummy_req.table_idx]
+        dummy_slot = int(dummy_row[0].item())
+        try:
+            dummy_row[:2] = torch.arange(2, dtype=torch.int32, device=self.device)
+            req = Req(
+                input_ids=torch.zeros(2, dtype=torch.int32, device="cpu"),
+                table_idx=self.dummy_req.table_idx,
+                cached_len=1,
+                output_len=1,
+                uid=-1,
+                sampling_params=None,  # type: ignore[arg-type]
+                cache_handle=None,  # type: ignore[arg-type]
+            )
+            batch = Batch(reqs=[req], phase="decode", rows_per_req=1)
+            batch.padded_reqs = batch.reqs
+            batch.input_ids = torch.zeros(1, dtype=torch.int32, device=self.device)
+            batch.positions = torch.ones(1, dtype=torch.int32, device=self.device)
+            batch.out_loc = dummy_row[1:2]
+            if self.config.model_config.model_is_mrope:
+                batch.mrope_positions = batch.positions.unsqueeze(0).expand(3, -1).contiguous()
+            self.attn_backend.prepare_metadata(batch)
+            if self.linear_backend is not None:
+                self.linear_backend.prepare_metadata(batch)
+            with self.ctx.forward_batch(batch):
+                self.model.forward()
+        finally:
+            dummy_row.fill_(dummy_slot)
+        return True
 
     def shutdown(self) -> None:
         self.graph_runner.destroy_cuda_graphs()
@@ -1695,7 +1754,62 @@ def _check_cpu_mem_config(config, is_moe: bool) -> None:
     )
 
 
-def _precompile_attention_jit(config: EngineConfig) -> None:
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _uses_gguf_weights(config) -> bool:
+    """Whether the forward path rides on ``kernel.ggml`` (GGUF dense and/or experts)."""
+    path = str(getattr(config, "model_path", "") or "")
+    if path.endswith(".gguf"):
+        return True
+    try:
+        from freetoken.models.gguf.reader import gguf_config_source
+
+        if gguf_config_source(path) is not None:
+            return True
+    except Exception:  # noqa: BLE001 -- the answer is only a precompile hint
+        pass
+    mc = getattr(config, "model_config", None)
+    quant = str(getattr(mc, "expert_quant", "") or "") if mc is not None else ""
+    wfmt = str(getattr(mc, "moe_weight_format", "") or "") if mc is not None else ""
+    return quant in ("gguf", "gguf_scaled", "gguf_kq", "q4_0") or wfmt in ("gguf", "q4_0")
+
+
+def _precompile_ggml(config, *, raise_on_error: bool = False) -> None:
+    """Compile the ggml-CUDA module now when the checkpoint rides on it.
+
+    GGUF dense projections and experts go through ``kernel.ggml``; without a prebuilt
+    kernel cache that module is nvcc-compiled on first use (several GiB of host RAM).
+    Under ``--cpu-mem`` the first use is the first forward, stacked on the pinned/spilled
+    expert banks -- the classic request-time OOM. Best-effort like the attention warmup."""
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return
+    if not _uses_gguf_weights(config):
+        return
+    import time
+
+    t0 = time.perf_counter()
+    try:
+        from freetoken.kernel import ggml
+
+        ggml._module()
+        logger.info_rank0(
+            f"ggml CUDA kernels ready before the expert banks ({time.perf_counter() - t0:.1f}s)"
+        )
+    except Exception as exc:  # noqa: BLE001 -- precompile is an optimization, never a boot failure
+        if raise_on_error:
+            raise
+        logger.warning_rank0(f"ggml kernel precompile skipped ({type(exc).__name__}: {exc})")
+
+
+def _precompile_kernels(config, *, raise_on_error: bool = False) -> None:
+    """Load every AOT module the forward path needs, before the expert banks are resident."""
+    _precompile_attention_jit(config, raise_on_error=raise_on_error)
+    _precompile_ggml(config, raise_on_error=raise_on_error)
+
+
+def _precompile_attention_jit(config: EngineConfig, *, raise_on_error: bool = False) -> None:
     """Compile FlashInfer's prefill/decode kernels BEFORE the expert banks are loaded.
 
     The JIT compile (nvcc + the torch extension build) is the largest transient host-RAM
@@ -1737,6 +1851,8 @@ def _precompile_attention_jit(config: EngineConfig) -> None:
         decode.build_and_load()
         logger.info_rank0("FlashInfer attention kernels ready (prefill + decode)")
     except Exception as exc:  # noqa: BLE001 -- precompile is an optimization, never a boot failure
+        if raise_on_error:
+            raise
         logger.warning_rank0(f"attention kernel precompile skipped ({type(exc).__name__}: {exc})")
 
 
