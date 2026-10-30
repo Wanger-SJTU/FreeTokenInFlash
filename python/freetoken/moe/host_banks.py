@@ -148,6 +148,7 @@ class HostBank:
             self._pinned = True  # born pinned+mapped; pin() is a no-op
         elif backing == "file":
             self._buf, self._spill_fd = _mmap_spill_tmpfile(asize, spill_dir)
+            _SPILL_BANKS.append(self)
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
@@ -289,6 +290,26 @@ def _os_lock(addr: int, nbytes: int) -> None:
 def alloc_banks(specs: dict[str, tuple[tuple[int, ...], torch.dtype]]) -> dict[str, HostBank]:
     """Allocate (lazy, unpinned) host banks from ``{name: (shape, dtype)}``."""
     return {name: HostBank(shape, dtype) for name, (shape, dtype) in specs.items()}
+
+
+# The file-backed spill banks, kept for the prefill cache dropper below.
+_SPILL_BANKS: list["HostBank"] = []
+
+
+def drop_spill_page_cache() -> None:
+    """Drop the resident pages and page cache of every file-backed spill bank.
+
+    An unpinned layer's prefill copies the whole layer to the GPU; the spill-file pages it
+    faulted in are dead weight afterwards. They are also *mapped*, so a bare
+    ``posix_fadvise`` cannot evict them -- unmap our PTEs first, then drop the cache.
+    Otherwise every prefill (chunked or not) re-fills the page cache with the whole
+    spilled expert set, which is how a 16 GiB spill set OOMs a 14 GiB host."""
+    for bank in _SPILL_BANKS:
+        bank.drop_pages()  # unmap our PTEs so the cache pages become evictable
+        try:
+            os.posix_fadvise(bank._spill_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, OSError, TypeError):
+            pass
 
 
 def _mmap_spill_tmpfile(asize: int, spill_dir: str | None) -> tuple[mmap.mmap, int]:

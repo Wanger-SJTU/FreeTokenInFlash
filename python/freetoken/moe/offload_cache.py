@@ -1268,6 +1268,11 @@ class OffloadMoeCache:
             # never CUDA-graph captured: prefill is not captured, and decode of an unpinned layer routes to the CPU executor or, locked_hybrid, to the staged fetch above
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, 0)):
                 view.copy_(per_layer[layer_id])
+            # the spilled layer's file pages are dead weight once its rows are on the GPU;
+            # without this every prefill re-fills the page cache with the whole spill set
+            from freetoken.moe.host_banks import drop_spill_page_cache
+
+            drop_spill_page_cache()
             return
         # materialize stages rows of staging buffer 0; ensure stages slots local to the layer's pool
         whole = self._pending_whole_layer
