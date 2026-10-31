@@ -6,7 +6,9 @@ from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.moe import is_offload_moe_strategy
 from freetoken.moe.fused import fused_topk
+from freetoken.moe.oea import oea_select
 from freetoken.moe.offload_cache import OffloadMoeCache
+from freetoken.utils import init_logger
 
 
 from .base import BaseOP
@@ -19,6 +21,8 @@ if TYPE_CHECKING:
 # is computed outside the MoE layer. Such models call ``routed_forward`` with a
 # precomputed routing instead of going through the generic softmax+top-k path.
 TopK = Tuple[torch.Tensor, torch.Tensor]
+
+logger = init_logger(__name__)
 
 # Hybrid decode overlaps the CPU overflow GEMV behind the GPU PCIe fetch + GEMM by
 # default. Set FREETOKEN_HYBRID_OVERLAP=0 to force the serial path (CPU sync before the
@@ -159,6 +163,7 @@ class OffloadMoELayer(MoELayer):
         has_bias: bool = False,
         strategy: str = "offload",
         decode_target: str = "gpu",
+        prefill_oea_k0: int = 0,
         quant_config: QuantConfig | None = None,
         prefix: str = "",
     ):
@@ -183,6 +188,8 @@ class OffloadMoELayer(MoELayer):
             prefix=prefix,
         )
         self.offload_cache: OffloadMoeCache | None = None
+        # simplified OEA for prefill expert loading (arXiv:2511.02237); 0 = classic
+        self.prefill_oea_k0 = int(prefill_oea_k0)
 
     @property
     def skips_inactive_slots(self) -> bool:
@@ -241,6 +248,18 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
+        cache = self.offload_cache
+        if (
+            self.prefill_oea_k0 > 0
+            and cache is not None
+            and not cache.prefill_overlap
+            and router_logits is not None
+        ):
+            scores = torch.softmax(router_logits.float(), dim=-1)
+            topk_ids, topk_weights, union = oea_select(
+                scores, self.top_k, self.prefill_oea_k0, renormalize=self.renormalize
+            )
+            return self._prefill_routed_sparse(hidden_states, topk_weights, topk_ids, union)
         topk_weights, topk_ids = fused_topk(
             hidden_states=hidden_states,
             gating_output=router_logits,
@@ -383,6 +402,44 @@ class OffloadMoELayer(MoELayer):
         cache.release_prefill_layer(self.layer_id)
         return out
 
+    def _prefill_routed_sparse(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        union: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prefill with only the batch's activated-expert union staged (simplified OEA).
+
+        The grouped GEMM addresses experts by id, so the rows outside ``union`` are never
+        read; unfilled routing slots repeat a resident expert with weight 0. On an
+        offload cache this is the only prefill path that reads less than one full layer.
+        """
+        cache = self.offload_cache
+        assert cache is not None, "sparse prefill needs the offload cache"
+        if os.environ.get("FREETOKEN_DEBUG_OEA"):
+            logger.info_rank0(
+                f"OEA prefill layer {self.layer_id}: tokens={topk_ids.shape[0]} "
+                f"ranks={topk_ids.shape[1]} union={union.numel()}/{self.num_experts} "
+                f"ids_max={int(topk_ids.max())} wsum={float(topk_weights.sum(-1).min()):.3f}"
+                f"..{float(topk_weights.sum(-1).max()):.3f}"
+            )
+        cache.materialize_experts(self.layer_id, union)
+        out = self._expert_gemm(
+            cache,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            views=cache.stage_views(self.layer_id, 0),
+            n=self.num_experts,
+            alphas=cache.alphas_for_layer(self.layer_id),
+            is_prefill=True,
+        )
+        if os.environ.get("FREETOKEN_DEBUG_OEA"):
+            torch.cuda.synchronize()
+        cache.release_prefill_layer(self.layer_id)
+        return out
+
     def _wait_prefill_overlap(self, cache: OffloadMoeCache) -> tuple[torch.Tensor, ...]:
         """Double-buffer choreography for this layer's overlap prefill: kick off the
         next layer's full-layer H2D copy, then return this layer's bank views (in
@@ -489,4 +546,7 @@ def make_moe_layer(
         assert layer_id is not None, "offload MoE backends need the layer_id"
         kwargs["strategy"] = config.moe_strategy
         kwargs["decode_target"] = config.decode_target
+        if offload_cls is None:
+            # simplified OEA prefill loading; custom offload subclasses opt in themselves
+            kwargs["prefill_oea_k0"] = int(getattr(config, "prefill_oea_k0", 0) or 0)
     return layer_cls(**kwargs)

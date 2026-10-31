@@ -908,6 +908,22 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--prefill-oea-k0",
+        type=int,
+        default=ServerArgs.prefill_oea_k0,
+        metavar="K0",
+        help=(
+            "Prefill expert loading with simplified OEA (arXiv:2511.02237): keep each "
+            "token's top K0 experts as its baseline, let it piggyback on further top-k "
+            "experts already activated by the batch, and stage only that union into GPU "
+            "memory (on an offload cache this reads only those experts from the host "
+            "banks, or from the spill files). K0 = top-k is the lossless variant; smaller "
+            "K0 trades a little quality for fewer activated experts. 0 (default) = load "
+            "every expert (classic whole-layer prefill)."
+        ),
+    )
+
+    parser.add_argument(
         "--disable-moe-prefill-overlap",
         action="store_false",
         dest="moe_prefill_overlap",

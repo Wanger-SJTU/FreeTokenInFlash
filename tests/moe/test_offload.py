@@ -1331,3 +1331,122 @@ def test_host_ram_fits_parallel_sizes_subdirectory_shards(tmp_path, monkeypatch)
 
     monkeypatch.setattr(builtins, "open", fake_open)
     assert not _host_ram_fits_parallel(str(tmp_path))
+
+
+def test_oea_select_piggybacks_only_onto_the_batch_activated_union():
+    from freetoken.moe.oea import oea_select
+
+    scores = torch.tensor(
+        [
+            [0.40, 0.25, 0.10, 0.15, 0.10],
+            [0.10, 0.40, 0.25, 0.15, 0.10],
+            [0.10, 0.15, 0.40, 0.25, 0.10],
+            [0.10, 0.20, 0.05, 0.40, 0.25],
+        ],
+        dtype=torch.float32,
+    )
+    ids, weights, union = oea_select(scores, k=3, k0=1)
+    # baselines are the per-token top-1 ({0}, {1}, {2}, {3}); extra ranks join only if
+    # they are already active; token 3 drops its rank-1 (expert 4) and borrows a filler.
+    assert union.tolist() == [0, 1, 2, 3]
+    assert ids.tolist() == [[0, 1, 3], [1, 2, 3], [2, 3, 1], [3, 1, 0]]
+    assert ids.dtype == torch.int32
+    # every row is a set: a repeated expert id overflows the grouped GEMM's id compaction
+    for row in ids:
+        assert row.unique().numel() == row.numel()
+    # weights keep the router scores, renormalized over the kept set (paper Eq. 1)
+    kept = torch.zeros_like(weights, dtype=torch.bool)
+    top = torch.topk(scores, 3, dim=-1)
+    for t in range(scores.shape[0]):
+        kept[t] = torch.isin(ids[t], top.indices[t])
+    raw = torch.gather(scores, -1, ids.long()) * kept
+    expect = raw / raw.sum(-1, keepdim=True)
+    assert torch.allclose(weights, expect, atol=1e-6)
+    assert torch.allclose(weights.sum(-1), torch.ones(4), atol=1e-6)
+
+
+def test_oea_select_k0_equal_to_topk_is_the_lossless_union():
+    from freetoken.moe.oea import oea_select
+
+    scores = torch.tensor(
+        [
+            [0.40, 0.25, 0.10, 0.15, 0.10],
+            [0.10, 0.40, 0.25, 0.15, 0.10],
+            [0.10, 0.15, 0.40, 0.25, 0.10],
+        ],
+        dtype=torch.float32,
+    )
+    ids, weights, union = oea_select(scores, k=3, k0=3)
+    top = torch.topk(scores, 3, dim=-1)
+    assert ids.tolist() == top.indices.tolist()
+    expect = top.values / top.values.sum(-1, keepdim=True)
+    assert torch.allclose(weights, expect, atol=1e-6)
+    assert union.tolist() == sorted(set(top.indices.reshape(-1).tolist()))
+
+
+def test_materialize_experts_stages_only_selected_rows():
+    _layer, cache = _make_layer_and_cache()
+    for view in cache.stage_views(0, 0):
+        view.fill_(-7.0)
+    cache.materialize_experts(0, torch.tensor([1, 3], dtype=torch.int64))
+    for (per_layer, _), view in zip(cache.banks, cache.stage_views(0, 0)):
+        assert torch.equal(view[1], per_layer[0][1])
+        assert torch.equal(view[3], per_layer[0][3])
+        assert torch.equal(view[0], torch.full_like(view[0], -7.0))
+        assert torch.equal(view[2], torch.full_like(view[2], -7.0))
+
+
+def test_offload_moe_layer_prefill_sparse_oea_stages_only_the_union(monkeypatch):
+    layer, cache = _make_layer_and_cache()
+    layer.prefill_oea_k0 = 1
+    hidden_states = torch.randn(3, 8)
+    router_logits = torch.tensor(
+        [
+            [4.0, 3.0, 0.0, 1.0, 0.0],
+            [1.0, 4.0, 3.0, 0.0, 0.0],
+            [1.0, 0.0, 4.0, 3.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    calls = {}
+    monkeypatch.setattr(
+        cache,
+        "materialize_experts",
+        lambda layer_id, union: calls.setdefault("materialize", (layer_id, union.clone())),
+    )
+    monkeypatch.setattr(
+        cache, "materialize_layer", lambda layer_id: calls.setdefault("dense", layer_id)
+    )
+
+    def fake_fused(
+        hidden_states,
+        w1,
+        w2,
+        got_topk_weights,
+        got_topk_ids,
+        activation,
+        apply_router_weight_on_input,
+        act_alpha=1.0,
+        act_limit=float("inf"),
+    ):
+        calls["w1"] = w1
+        calls["ids"] = got_topk_ids.clone()
+        calls["weights"] = got_topk_weights.clone()
+        return hidden_states
+
+    monkeypatch.setattr("freetoken.moe.fused.fused_experts_impl", fake_fused)
+
+    out = layer.prefill_forward(hidden_states, router_logits)
+
+    assert out is hidden_states
+    assert "dense" not in calls
+    layer_id, union = calls["materialize"]
+    assert layer_id == 0 and union.tolist() == [0, 1, 2]
+    assert calls["ids"].dtype == torch.int32
+    # top_k=2 on this layer: each token's rank-1 expert joins only if already active;
+    # token 2's rank-1 (expert 3) is not, so it gets the resident filler with weight 0
+    assert calls["ids"].tolist() == [[0, 1], [1, 2], [2, 0]]
+    for row in calls["ids"]:
+        assert row.unique().numel() == row.numel()
+    assert torch.allclose(calls["weights"].sum(-1), torch.ones(3), atol=1e-6)
+    assert calls["w1"].data_ptr() == cache.bank_caches["gate_up"].data_ptr()

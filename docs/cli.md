@@ -101,6 +101,7 @@ See [models.md](models.md#moe-strategies) for what each strategy does, and [perf
 | `--moe-collect-stats` | off | Log decode MoE stats with each decode log line: hit rate, and per layer-step the misses, experts fetched and experts computed on CPU, for pinned, locked and CPU-only layers |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
+| `--prefill-oea-k0` | 0 (off) | Prefill expert loading with simplified OEA ([arXiv:2511.02237](https://arxiv.org/abs/2511.02237)): keep each token's top `K0` experts as its baseline, let it piggyback on further top-k experts already activated by the batch, and stage only that union into GPU memory. On an offload cache only those experts are copied from the host banks (and read from the `--cpu-mem` spill files), so a short prompt loads ~1/3 of a layer instead of all `num_experts`. `K0 = top-k` is lossless (union of the model's own top-k sets); smaller `K0` saves more at a quality cost. Needs `--moe-strategy offload`/`hybrid`; disables the prefill overlap (single staging buffer) |
 
 ### API behaviour
 

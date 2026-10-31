@@ -280,6 +280,9 @@ class ModelConfig:
     moe_strategy: str = "fused"
     # where routed experts decode (gpu / cpu / hybrid); set by the engine from the flags, it gates which expert kernels can serve
     decode_target: str = "gpu"
+    # --prefill-oea-k0: simplified OEA baseline experts per token for prefill expert
+    # loading (0 = off, full-layer prefill); set by the engine from the flag.
+    prefill_oea_k0: int = 0
     # The QuantConfig the engine builds from the checkpoint; layers ask it for their method.
     quant: Any | None = None
     # ----- optional, model-specific extensions (default keeps other models intact) -----

@@ -1114,6 +1114,28 @@ class OffloadMoeCache:
         self._pending_whole_layer = True
         materialize_layer(self, layer_id)
 
+    def materialize_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+        """Stage only ``expert_ids`` of ``layer_id`` into prefill buffer 0 (sparse/OEA prefill).
+
+        Each selected expert lands at its own row position, so the grouped GEMM keeps raw
+        expert ids as its mapping; rows outside the set are stale and never gathered. For
+        file-backed spill layers only the selected experts' pages are faulted in, and the
+        spill page cache is dropped afterwards like in the whole-layer pageable path.
+        """
+        assert self.banks, "set_bank_sources must register the banks first"
+        # staging slots stop being registered to their experts (same bookkeeping as
+        # materialize_layer) so decode re-fetches them instead of trusting stale rows
+        self._invalidate_prefill_buffer(0, layer_id)
+        ids_host = expert_ids.cpu()
+        ids_dev = expert_ids.to(device=self.device, dtype=torch.long)
+        for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, 0)):
+            source = per_layer[layer_id].index_select(0, ids_host)
+            view.index_copy_(0, ids_dev, source.to(view.device, non_blocking=True))
+        if layer_id in self._unpinned_layers:
+            from freetoken.moe.host_banks import drop_spill_page_cache
+
+            drop_spill_page_cache()
+
     def reset(self) -> None:
         from freetoken.moe.offload_kernels import reset_cache
 

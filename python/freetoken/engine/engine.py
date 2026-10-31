@@ -2383,6 +2383,29 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(model_config, "moe_strategy", config.moe_strategy)
         object.__setattr__(model_config, "decode_target", _decode_target(config))
 
+        oea_k0 = int(getattr(config, "prefill_oea_k0", 0) or 0)
+        if oea_k0 > 0:
+            if config.moe_strategy not in ("offload", "hybrid"):
+                raise ValueError(
+                    "--prefill-oea-k0 needs --moe-strategy offload or hybrid: sparse prefill "
+                    f"stages selected experts into the offload slot cache, got {config.moe_strategy!r}"
+                )
+            topk = model_config.num_experts_per_tok
+            oea_k0 = max(1, min(oea_k0, topk))
+            object.__setattr__(model_config, "prefill_oea_k0", oea_k0)
+            if config.moe_prefill_overlap:
+                override("moe_prefill_overlap", False)
+                logger.info_rank0(
+                    "--prefill-oea-k0: MoE prefill overlap disabled (sparse prefill stages "
+                    "the activated union into the single staging buffer)"
+                )
+            logger.info_rank0(
+                f"--prefill-oea-k0 {oea_k0}/{topk}: prefill stages only the batch's "
+                "activated experts (simplified OEA)"
+            )
+    elif int(getattr(config, "prefill_oea_k0", 0) or 0) > 0:
+        raise ValueError("--prefill-oea-k0 is a MoE expert-loading option; this model has no MoE layers")
+
     # Must stay LAST: page_size is only final here (_adjust_dsv4_config sets P=128, the
     # TRTLLM block sets 64). Also covers the programmatic LLM(...) path that bypasses parse_args.
     if config.num_token_override is not None:
