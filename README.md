@@ -58,6 +58,34 @@ For More details:
 - [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)
 - [Diagnosing a checkpoint that fails to load](https://github.com/FlashML-org/FreeToken/blob/main/scripts/checkpoint_diagnose/README.md)
 
+## Sparse prefill expert loading (OEA)
+
+Prefill used to stage every expert of a layer into GPU memory. With
+`--prefill-oea-k0 K0` the engine stages only the experts the batch actually
+activates (simplified OEA, [arXiv:2511.02237](https://arxiv.org/abs/2511.02237)):
+each token keeps its top-`K0` experts as a baseline, additional top-k experts
+already active in the batch piggyback for free, and the routing weights are
+renormalized over the kept set. `K0 = top-k` is the lossless variant; smaller
+`K0` trades a little quality for a smaller load. It needs an offload MoE cache
+(`--moe-strategy offload`/`hybrid`) and disables the two-buffer prefill overlap
+(single staging buffer).
+
+Measured on RTX 3060 12 GB + 14 GiB host RAM, Qwen3.6-35B-A3B-UD-Q4_K_M,
+`--cpu-mem 2GiB` (4/40 layers pinned, 36 spilled), 8 GiB cgroup, greedy 32
+output tokens; TTFT is the median of 2-3 runs (run-to-run spread follows the
+spill files' page cache and can exceed 30%):
+
+| Prefill staging | short prompt (16 tok) | long prompt (152 tok) | warmup |
+|---|---|---|---|
+| off (256/256 experts) | 14.51 s | 10.79 s | 30.9 s |
+| `--prefill-oea-k0 8` (union 88/256, 202/256) | 5.37 s | 9.46 s | 7.1 s |
+| `--prefill-oea-k0 4` (union 51/256, 136/256) | 3.00 s | 5.94 s | 4.9 s |
+
+Decode throughput is unchanged (4.6-4.8 tok/s): OEA only affects prefill loading.
+The three settings produce byte-identical greedy outputs for these prompts; longer
+prompts saturate the union (202/256 at 152 tokens), so the lossless gain shrinks
+with prompt length.
+
 ## Citation
 
 If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
